@@ -25,3 +25,7 @@ shell-words = "1.1"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 
+[target.'cfg(windows)'.dependencies]
+process-wrap.workspace = true
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
+

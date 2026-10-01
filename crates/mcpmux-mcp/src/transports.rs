@@ -9,24 +9,28 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 
-#[cfg(windows)]
-#[allow(unused_imports)] // Trait is used via method call in closure
-use std::os::windows::process::CommandExt;
-
 use anyhow::{Context, Result};
+#[cfg(not(windows))]
+use rmcp::transport::ConfigureCommandExt;
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
         ListToolsResult, Tool,
     },
     service::RunningService,
-    transport::{ConfigureCommandExt, TokioChildProcess},
+    transport::TokioChildProcess,
     ClientHandler, RoleClient, ServiceExt,
 };
 use serde_json::Value;
+#[cfg(not(windows))]
 use tokio::process::Command;
 use tokio::sync::RwLock;
+
+#[cfg(windows)]
+use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
 use tracing::{debug, error, info, warn};
+#[cfg(windows)]
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 /// Transport configuration for MCP server connections
 #[derive(Debug, Clone)]
@@ -125,11 +129,25 @@ impl McpSession {
             "Connecting to stdio MCP server"
         );
 
-        // Clone for the closure
+        #[cfg(not(windows))]
         let args_for_closure = parsed_args.clone();
         let env = env.clone();
 
-        // Create child process transport using the POC pattern
+        #[cfg(windows)]
+        let transport = {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let mut command = CommandWrap::with_new(&executable, |cmd| {
+                cmd.args(&parsed_args).envs(&env).stderr(Stdio::null());
+            });
+            command.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
+            command.wrap(JobObject);
+            command.wrap(KillOnDrop);
+            TokioChildProcess::new(command).context(format!(
+                "Failed to spawn child process. Command not found: {}. Ensure it's installed and in PATH.",
+                executable
+            ))?
+        };
+        #[cfg(not(windows))]
         let transport = TokioChildProcess::new(
             Command::new(&executable).configure(move |cmd| {
                 cmd.args(&args_for_closure)

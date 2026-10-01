@@ -120,6 +120,16 @@ impl PoolService {
         self.connection_service.oauth_manager()
     }
 
+    /// Drop every active backend connection during gateway shutdown.
+    ///
+    /// Dropping the client transports triggers their configured child-process
+    /// cleanup, including Windows Job Object termination for stdio servers.
+    pub fn shutdown(&self) {
+        let count = self.instances.len();
+        self.instances.clear();
+        info!("[PoolService] Released {count} backend connection(s) for gateway shutdown");
+    }
+
     /// Read a resource from a backend server
     ///
     /// On auth errors, automatically reconnects the server and retries once.

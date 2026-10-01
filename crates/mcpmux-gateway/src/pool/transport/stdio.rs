@@ -16,12 +16,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mcpmux_core::{LogLevel, LogSource, ServerLog, ServerLogManager};
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+#[cfg(not(windows))]
+use rmcp::transport::ConfigureCommandExt;
+use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{ChildStderr, Command};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+#[cfg(windows)]
+use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+#[cfg(windows)]
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 use super::shell_env;
 use super::TransportType;
@@ -47,6 +54,23 @@ pub fn configure_child_process_platform(cmd: &mut Command) {
     {
         cmd.process_group(0);
     }
+}
+
+#[cfg(windows)]
+fn stdio_child_command(
+    command_path: &std::path::Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> CommandWrap {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut command = CommandWrap::with_new(command_path, |cmd| {
+        cmd.args(args).envs(env);
+    });
+    command.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
+    command.wrap(JobObject);
+    command.wrap(KillOnDrop);
+    command
 }
 
 /// Returns a helpful hint for common runtime-dependent commands when they fail.
@@ -231,24 +255,27 @@ impl Transport for StdioTransport {
         let mut env = self.env.clone();
         inject_shell_path(&mut env, shell_path);
 
-        let (transport, child_stderr) =
-            match TokioChildProcess::builder(Command::new(&command_path).configure(move |cmd| {
+        #[cfg(windows)]
+        let transport_builder =
+            TokioChildProcess::builder(stdio_child_command(&command_path, &args, &env));
+        #[cfg(not(windows))]
+        let transport_builder =
+            TokioChildProcess::builder(Command::new(&command_path).configure(move |cmd| {
                 cmd.args(&args).envs(&env).kill_on_drop(true);
                 configure_child_process_platform(cmd);
-            }))
-            .stderr(Stdio::piped())
-            .spawn()
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    let hint = command_hint(&self.command);
-                    let err = format!("Failed to spawn process: {e}.{hint}");
-                    error!(server_id = %self.server_id, "{}", err);
-                    self.log(LogLevel::Error, LogSource::Connection, err.clone())
-                        .await;
-                    return TransportConnectResult::Failed(err);
-                }
-            };
+            }));
+
+        let (transport, child_stderr) = match transport_builder.stderr(Stdio::piped()).spawn() {
+            Ok(result) => result,
+            Err(e) => {
+                let hint = command_hint(&self.command);
+                let err = format!("Failed to spawn process: {e}.{hint}");
+                error!(server_id = %self.server_id, "{}", err);
+                self.log(LogLevel::Error, LogSource::Connection, err.clone())
+                    .await;
+                return TransportConnectResult::Failed(err);
+            }
+        };
 
         // Start the async stderr reader if we got a handle
         if let Some(stderr) = child_stderr {
