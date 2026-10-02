@@ -36,6 +36,8 @@ const MOCK_BUNDLE_API_PORT = 8787;
 const STUB_MCP_HTTP_PORT = 3457;
 const STUB_MCP_OAUTH_PORT = 3458;
 
+// Keep E2E data outside the user's McpMux profile. The desktop app accepts this
+// directory only when MCPMUX_E2E_TEST is also set.
 const APP_DATA_DIR = path.join(os.tmpdir(), 'mcpmux-e2e');
 const BUNDLE_CACHE_PATH = path.join(APP_DATA_DIR, 'cache', 'registry-bundle.json');
 
@@ -188,7 +190,10 @@ async function startMockServers(): Promise<void> {
 // Stop all mock servers
 function stopMockServers(): void {
   for (const server of [mockBundleApi, stubMcpHttp, stubMcpOauth]) {
-    if (!server?.pid) continue;
+    if (!server?.pid) {
+      continue;
+    }
+
     if (process.platform === 'win32') {
       spawnSync('taskkill', ['/F', '/T', '/PID', String(server.pid)], { stdio: 'ignore' });
     } else {
@@ -285,6 +290,30 @@ function killTauriDriverProcesses(): void {
     }
   } catch {
     // Ignore errors - the driver may not be running.
+  }
+}
+
+function killGatewayPortProcess(): void {
+  try {
+    if (process.platform === 'win32') {
+      const result = spawnSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' });
+      const pids = new Set<number>();
+
+      for (const line of result.stdout.split(/\r?\n/)) {
+        const match = line.match(/^\s*TCP\s+\S+:45818\s+\S+\s+\S+\s+(\d+)\s*$/i);
+        if (match) {
+          pids.add(Number(match[1]));
+        }
+      }
+
+      for (const pid of pids) {
+        spawnSync('taskkill', ['/F', '/PID', String(pid)], { stdio: 'ignore' });
+      }
+    } else {
+      spawnSync('fuser', ['-k', '-9', '45818/tcp'], { stdio: 'ignore' });
+    }
+  } catch {
+    // Ignore errors - nothing may be listening on the gateway port.
   }
 }
 
@@ -434,6 +463,7 @@ export const config: Options.Testrunner = {
     // to delete the SQLite DB while the app still holds a lock on it.
     killMcpmuxProcesses();
     killTauriDriverProcesses();
+    killGatewayPortProcess();
     // Brief pause to let processes fully exit
     await new Promise((resolve) => setTimeout(resolve, 2000));
     clearSingleInstanceLock();
@@ -466,9 +496,7 @@ export const config: Options.Testrunner = {
     clearSingleInstanceLock();
 
     // Free the gateway port (45818) in case mcpmux didn't release it
-    if (process.platform !== 'win32') {
-      spawnSync('fuser', ['-k', '-9', '45818/tcp'], { stdio: 'ignore' });
-    }
+    killGatewayPortProcess();
 
     // Wait for OS to fully reclaim process resources (ports, file locks, etc.)
     await new Promise((resolve) => setTimeout(resolve, 2000));
