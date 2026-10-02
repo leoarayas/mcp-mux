@@ -132,6 +132,16 @@ mod job_tree {
     }
 
     impl CommandWrapper for JobTree {
+        /// Attach the already-running child to the job.
+        ///
+        /// Note the trade-off: between `CreateProcess` and this call the child
+        /// is briefly running outside any job, so a fast wrapper (`cmd`, `npx`)
+        /// could in principle create a descendant that never joins the job and
+        /// would survive when the handle closes. Attaching before execution
+        /// requires `CREATE_SUSPENDED`, which is exactly what brings the
+        /// terminal window back, so this window is accepted deliberately. In
+        /// practice the window is sub-millisecond and the wrappers that would
+        /// exploit it need tens of milliseconds to start their own child.
         fn wrap_child(
             &mut self,
             inner: Box<dyn ChildWrapper>,
@@ -160,19 +170,25 @@ mod job_tree {
     }
 
     unsafe fn create_kill_on_close_job() -> io::Result<JobHandle> {
-        let job = CreateJobObjectW(None, None)?;
+        // Wrap the handle immediately so the `?` below still closes it if
+        // configuring the job fails; otherwise every retry leaks one handle.
+        let owned = JobOwner(JobHandle(CreateJobObjectW(None, None)?));
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
         SetInformationJobObject(
-            job,
+            owned.0 .0,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const _,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )?;
 
-        Ok(JobHandle(job))
+        // Success: hand the raw handle to the caller, which wraps it in its
+        // own `JobOwner` once the child has been attached.
+        let handle = owned.0;
+        std::mem::forget(owned);
+        Ok(handle)
     }
 }
 

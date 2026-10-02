@@ -1505,14 +1505,18 @@ pub async fn restart_gateway(
     info!("[Gateway] Restart requested — tearing down current state");
     // Take handle out under lock; drop lock before awaiting shutdown so
     // start_gateway below can re-acquire it.
-    let handle = {
+    let (handle, pool_service) = {
         let mut state = gateway_state.write().await;
         let handle = state.handle.take();
+        let pool_service = state.pool_service.take();
         state.running = false;
         state.url = None;
         state.bound_port = None;
-        handle
+        (handle, pool_service)
     };
+    if let Some(pool) = pool_service {
+        pool.shutdown().await;
+    }
     if let Some(h) = handle {
         shutdown_gateway_handle(h).await;
     }

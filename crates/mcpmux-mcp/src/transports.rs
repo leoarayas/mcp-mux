@@ -104,6 +104,13 @@ mod job_tree {
     }
 
     impl CommandWrapper for JobTree {
+        /// Attach the already-running child to the kill-on-close job.
+        ///
+        /// The child is briefly running outside any job between
+        /// `CreateProcess` and this call; attaching before execution would
+        /// require `CREATE_SUSPENDED`, which is what makes the terminal window
+        /// reappear. See the equivalent wrapper in `mcpmux-gateway` for the
+        /// full reasoning and measurements.
         fn wrap_child(
             &mut self,
             inner: Box<dyn ChildWrapper>,
@@ -132,19 +139,22 @@ mod job_tree {
     }
 
     unsafe fn create_kill_on_close_job() -> io::Result<JobHandle> {
-        let job = CreateJobObjectW(None, None)?;
+        // Wrap immediately so the `?` below still closes the handle on failure.
+        let owned = JobOwner(JobHandle(CreateJobObjectW(None, None)?));
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
         SetInformationJobObject(
-            job,
+            owned.0 .0,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const _,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )?;
 
-        Ok(JobHandle(job))
+        let handle = owned.0;
+        std::mem::forget(owned);
+        Ok(handle)
     }
 }
 
