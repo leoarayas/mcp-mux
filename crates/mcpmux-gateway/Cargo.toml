@@ -56,6 +56,17 @@ dirs = "5.0"
 # MCP SDK
 rmcp.workspace = true
 
+# OAuth
+oauth2 = "5"
+
+# Internal crates (path-only, no version needed)
+mcpmux-core.workspace = true
+mcpmux-storage.workspace = true
+
+# Windows-only: stdio child-process containment.
+# Must stay after every shared dependency: in TOML, keys below a table
+# header belong to that table, so placing this earlier would silently make
+# oauth2 / mcpmux-core / mcpmux-storage Windows-only and break Linux CI.
 [target.'cfg(windows)'.dependencies]
 process-wrap.workspace = true
 windows = { version = "0.62.2", features = [
@@ -63,13 +74,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
-
-# OAuth
-oauth2 = "5"
-
-# Internal crates (path-only, no version needed)
-mcpmux-core.workspace = true
-mcpmux-storage.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
