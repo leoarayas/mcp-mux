@@ -1,7 +1,7 @@
 //! Verifies that the gateway's internal `DomainEvent` broadcast is
 //! bridged into the runtime's shared `EventBus`. Future control-socket
-//! + `*AppService` subscribers (Phase 3+) depend on this so a single
-//! subscription sees every event the running process emits.
+//! subscribers (Phase 3+) depend on this so a single subscription sees
+//! every event the running process emits.
 
 use std::sync::Arc;
 use std::time::Duration;

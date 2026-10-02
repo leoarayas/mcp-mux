@@ -188,7 +188,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 last_error, "[mcpmuxd] /health did not return 200 within the probe window"
             );
             shutdown_pool_service.shutdown().await;
-    shutdown_gateway_handle(handle).await;
+            shutdown_gateway_handle(handle).await;
             shutdown_task.abort();
             return Err(anyhow::anyhow!("health probe failed"));
         }
@@ -215,7 +215,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Err(e) => {
             error!(error = %e, "[mcpmuxd] control socket failed to start");
             shutdown_pool_service.shutdown().await;
-    shutdown_gateway_handle(handle).await;
+            shutdown_gateway_handle(handle).await;
             shutdown_task.abort();
             return Err(anyhow::anyhow!(e.to_string()));
         }
