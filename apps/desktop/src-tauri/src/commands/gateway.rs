@@ -1151,7 +1151,7 @@ pub async fn stop_gateway(
     };
 
     if let Some(pool) = pool_service {
-        pool.shutdown();
+        pool.shutdown().await;
     }
 
     if let Some(h) = handle {

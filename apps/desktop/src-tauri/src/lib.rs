@@ -1053,9 +1053,9 @@ pub fn run() {
                             state.bound_port = None;
                             (state.handle.take(), state.pool_service.take())
                         };
-                        if let Some(pool) = pool_service {
-                            pool.shutdown();
-                        }
+                            if let Some(pool) = pool_service {
+                                pool.shutdown().await;
+                            }
                         if let Some(h) = handle {
                             info!("[Gateway] ExitRequested — gracefully shutting down gateway");
                             crate::commands::gateway::shutdown_gateway_handle(h).await;

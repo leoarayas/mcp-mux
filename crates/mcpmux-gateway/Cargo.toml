@@ -56,6 +56,14 @@ dirs = "5.0"
 # MCP SDK
 rmcp.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+process-wrap.workspace = true
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 # OAuth
 oauth2 = "5"
 
@@ -65,7 +73,3 @@ mcpmux-storage.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
-
-[target.'cfg(windows)'.dependencies]
-process-wrap.workspace = true
-windows = { version = "0.62.2", features = ["Win32_System_Threading"] }

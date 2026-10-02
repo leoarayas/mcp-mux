@@ -120,16 +120,6 @@ impl PoolService {
         self.connection_service.oauth_manager()
     }
 
-    /// Drop every active backend connection during gateway shutdown.
-    ///
-    /// Dropping the client transports triggers their configured child-process
-    /// cleanup, including Windows Job Object termination for stdio servers.
-    pub fn shutdown(&self) {
-        let count = self.instances.len();
-        self.instances.clear();
-        info!("[PoolService] Released {count} backend connection(s) for gateway shutdown");
-    }
-
     /// Read a resource from a backend server
     ///
     /// On auth errors, automatically reconnects the server and retries once.
@@ -360,6 +350,27 @@ impl PoolService {
                 space_id, server_id
             );
         }
+    }
+
+    /// Close every live backend connection without changing persisted credentials.
+    ///
+    /// This is used when the gateway stops or the desktop app exits. In
+    /// particular, closing a stdio connection releases its process transport;
+    /// on Windows that terminates the whole Job Object, including descendants
+    /// created by wrappers such as `npx`.
+    pub async fn shutdown(&self) {
+        let instances: Vec<Arc<ServerInstance>> = self
+            .instances
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        let count = instances.len();
+        self.instances.clear();
+        futures::future::join_all(instances.iter().map(|instance| instance.shutdown())).await;
+        info!(
+            "[PoolService] Released {} backend connection(s) for gateway shutdown",
+            count
+        );
     }
 
     /// Disconnect a server (logout - clears tokens but keeps DCR)
