@@ -116,6 +116,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // Capture the pool/feature/server-manager handles before `spawn` consumes
     // the server; the control socket drives the same live instances.
     let control_pool_service = server.pool_service();
+    let shutdown_pool_service = control_pool_service.clone();
     let control_feature_service = server.feature_service();
     let control_server_manager = server.server_manager();
 
@@ -186,7 +187,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 attempts,
                 last_error, "[mcpmuxd] /health did not return 200 within the probe window"
             );
-            shutdown_gateway_handle(handle).await;
+            shutdown_pool_service.shutdown().await;
+    shutdown_gateway_handle(handle).await;
             shutdown_task.abort();
             return Err(anyhow::anyhow!("health probe failed"));
         }
@@ -212,7 +214,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Ok(server) => server,
         Err(e) => {
             error!(error = %e, "[mcpmuxd] control socket failed to start");
-            shutdown_gateway_handle(handle).await;
+            shutdown_pool_service.shutdown().await;
+    shutdown_gateway_handle(handle).await;
             shutdown_task.abort();
             return Err(anyhow::anyhow!(e.to_string()));
         }
@@ -229,6 +232,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
 
     drop(control_server);
+    shutdown_pool_service.shutdown().await;
     shutdown_gateway_handle(handle).await;
 
     info!("[mcpmuxd] stopped cleanly");
