@@ -528,6 +528,57 @@ async fn servers_configure_merges_instead_of_replacing() {
     let _ = child.wait();
 }
 
+/// Deleting a client also removes the `<client_id> → Starter` id binding
+/// that `clients.create` added.
+#[tokio::test]
+async fn clients_delete_removes_the_auto_created_binding() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
+
+    let roots = || async {
+        let list = call(&socket, &request("w", "workspaces.list")).await;
+        assert!(list.ok, "workspaces.list failed: {:?}", list.error);
+        list.data
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["workspace_root"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let created = call(
+        &socket,
+        &request_with(
+            "c1",
+            "clients.create",
+            serde_json::json!({"name": "Temp", "client_type": "cursor"}),
+        ),
+    )
+    .await;
+    assert!(created.ok, "clients.create failed: {:?}", created.error);
+    let client_id = created.data.unwrap()["id"].as_str().unwrap().to_string();
+    assert!(
+        roots().await.contains(&client_id),
+        "auto-map binding missing"
+    );
+
+    let deleted = call(
+        &socket,
+        &request_with("d1", "clients.delete", serde_json::json!({"id": client_id})),
+    )
+    .await;
+    assert!(deleted.ok, "clients.delete failed: {:?}", deleted.error);
+    assert!(!roots().await.contains(&client_id), "binding left behind");
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait();
+}
+
 #[tokio::test]
 async fn config_import_round_trips_a_space() {
     let data_dir = tempfile::tempdir().unwrap();

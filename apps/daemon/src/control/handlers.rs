@@ -1572,6 +1572,23 @@ async fn clients_delete(
     if !deleted {
         return Err(ApiError::not_found(format!("client {} not found", p.id)));
     }
+
+    // Remove the `<client_id> → Starter` id binding `clients create` added,
+    // as the desktop does: otherwise it lingers in `workspaces list`, and a
+    // future client reusing the id would inherit its routing.
+    let bindings = &state.runtime.repositories.workspace_binding;
+    match bindings.find_by_id_key(&p.id).await {
+        Ok(Some(binding)) => match bindings.delete(&binding.id).await {
+            Ok(()) => state.emit(DomainEvent::WorkspaceBindingChanged {
+                space_id: binding.space_id,
+                workspace_root: binding.workspace_root,
+            }),
+            Err(e) => warn!(error = %e, "[control] failed to remove the id binding for {}", p.id),
+        },
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "[control] failed to look up the id binding for {}", p.id),
+    }
+
     state.emit(DomainEvent::ClientDeleted {
         client_id: p.id.clone(),
     });
