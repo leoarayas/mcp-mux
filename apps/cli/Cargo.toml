@@ -17,10 +17,13 @@ path = "src/lib.rs"
 [dependencies]
 mcpmux-control.workspace = true
 mcpmux-runtime.workspace = true
+# Only for configure_child_process_platform (already a transitive dependency
+# through mcpmux-runtime).
+mcpmux-gateway.workspace = true
 
 clap.workspace = true
 
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process"] }
 
 serde.workspace = true
 serde_json.workspace = true

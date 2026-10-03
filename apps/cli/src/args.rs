@@ -122,10 +122,10 @@ pub enum DaemonCommand {
     /// Manage the persisted gateway port override.
     #[command(subcommand)]
     Port(PortCommand),
-    /// Restart the daemon by SIGTERM-ing the live process and re-execing it
-    /// with the same arguments. Fails if the daemon is not supervised by this
-    /// CLI (e.g. when running under systemd, use `systemctl --user restart
-    /// mcpmux.service` instead).
+    /// Restart the daemon by SIGTERM-ing the live process, waiting for it to
+    /// exit, and re-execing it with the same arguments. Refuses when the
+    /// daemon runs under systemd; use `systemctl --user restart
+    /// mcpmux.service` there instead.
     Restart,
 }
 

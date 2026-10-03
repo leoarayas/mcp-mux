@@ -49,7 +49,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Daemon {
             command: DaemonCommand::Restart,
         } => {
-            return daemon_restart(client, &cli.output).await;
+            return daemon_restart(client, cli.socket.as_deref(), &cli.output).await;
         }
         Command::Health => {
             let value = client.call(Method::Health, json!({})).await?;
@@ -1005,13 +1005,26 @@ fn render_mutation(value: &Value) -> Result<()> {
 }
 
 // =============================================================================
-// `daemon restart` — kill the running daemon and re-exec it with the same
-// arguments. Unix-only because we read /proc/<pid>/{exe,cmdline}. Caller must
-// close the control socket before invoking this.
+// `daemon restart` — stop the running daemon and re-exec it with the same
+// arguments. Unix-only because we read /proc/<pid>/{exe,cmdline,environ}.
+// Refuses to touch a systemd-supervised daemon. Caller must close the
+// control socket before invoking this.
 // =============================================================================
 
+/// How long the old daemon may take to drain and exit after SIGTERM.
 #[cfg(unix)]
-async fn daemon_restart(mut client: ControlClient, mode: &OutputMode) -> Result<ExitCode> {
+const RESTART_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the replacement daemon may take to answer on its control socket.
+#[cfg(unix)]
+const RESTART_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[cfg(unix)]
+async fn daemon_restart(
+    mut client: ControlClient,
+    socket_override: Option<&std::path::Path>,
+    mode: &OutputMode,
+) -> Result<ExitCode> {
     let status = client.call(Method::Status, json!({})).await?;
     let pid: u32 = str_at(&status, "pid")
         .parse()
@@ -1021,6 +1034,21 @@ async fn daemon_restart(mut client: ControlClient, mode: &OutputMode) -> Result<
     let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
     if !proc.exists() {
         bail!("daemon pid {pid} is not running");
+    }
+
+    // A daemon that systemd started lives in its own `<unit>.service`
+    // cgroup. Killing it and spawning an unsupervised copy would lose
+    // supervision, so send the operator to systemctl instead. (Environment
+    // markers such as INVOCATION_ID are inherited by ordinary terminal
+    // sessions, so they cannot tell the two cases apart.)
+    if let Some(unit) = supervising_systemd_unit(pid) {
+        let scope = if unit.user { "--user " } else { "" };
+        bail!(
+            "daemon pid {pid} is managed by systemd unit {}; restart it with \
+             `systemctl {scope}restart {}`",
+            unit.name,
+            unit.name
+        );
     }
 
     let exe = std::fs::read_link(proc.join("exe"))
@@ -1036,42 +1064,71 @@ async fn daemon_restart(mut client: ControlClient, mode: &OutputMode) -> Result<
 
     drop(client);
 
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-
-    let socket_path = client_socket_path(&data_dir);
-    for _ in 0..50 {
-        if !socket_path.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    if socket_path.exists() {
+    // SAFETY: plain signal delivery to a pid we just read from the daemon.
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
         bail!(
-            "daemon did not release {} within 5s; refusing to spawn a replacement \
-             (another process may own the socket)",
-            socket_path.display()
+            "cannot signal daemon pid {pid}: {}",
+            std::io::Error::last_os_error()
         );
     }
 
-    let mut cmd = std::process::Command::new(&exe);
+    // The data-dir lock and the gateway port are released only when the old
+    // process exits; the control socket disappears long before that.
+    if !wait_for_exit(pid, RESTART_EXIT_TIMEOUT).await {
+        bail!(
+            "daemon pid {pid} did not exit within {}s of SIGTERM; not starting a replacement",
+            RESTART_EXIT_TIMEOUT.as_secs()
+        );
+    }
+
+    let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let child = cmd
+    mcpmux_gateway::pool::transport::configure_child_process_platform(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", exe.display()))?;
+    let new_pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("replacement daemon exited immediately"))?;
+
+    // Report success only once the replacement answers as itself.
+    let socket_path = match socket_override {
+        Some(path) => path.to_path_buf(),
+        None => mcpmux_runtime::control_socket_path(std::path::Path::new(&data_dir)),
+    };
+    let deadline = tokio::time::Instant::now() + RESTART_READY_TIMEOUT;
+    loop {
+        if let Some(exit) = child.try_wait()? {
+            bail!(
+                "replacement daemon exited during startup ({exit}); run `{} {}` in a \
+                 terminal to see why",
+                exe.display(),
+                args.join(" ")
+            );
+        }
+        if let Ok(mut fresh) = ControlClient::connect(None, Some(&socket_path)).await {
+            if let Ok(status) = fresh.call(Method::Status, json!({})).await {
+                if str_at(&status, "pid") == new_pid.to_string() {
+                    break;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "replacement daemon (pid {new_pid}) did not answer on {} within {}s",
+                socket_path.display(),
+                RESTART_READY_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     let summary = json!({
         "previous_pid": pid,
-        "new_pid": child.id(),
+        "new_pid": new_pid,
         "binary": exe.display().to_string(),
         "args": args,
     });
@@ -1079,8 +1136,73 @@ async fn daemon_restart(mut client: ControlClient, mode: &OutputMode) -> Result<
     Ok(ExitCode::SUCCESS)
 }
 
+/// The systemd service unit supervising a process.
+#[cfg(unix)]
+struct SystemdUnit {
+    name: String,
+    /// Started by the per-user manager (`systemctl --user`).
+    user: bool,
+}
+
+/// The `.service` unit whose cgroup holds `pid`, unless this CLI runs in
+/// that same cgroup (then the daemon was started by hand from this session,
+/// e.g. inside a terminal multiplexer that itself runs as a service).
+#[cfg(unix)]
+fn supervising_systemd_unit(pid: u32) -> Option<SystemdUnit> {
+    let daemon = unified_cgroup(&format!("/proc/{pid}/cgroup"))?;
+    if unified_cgroup("/proc/self/cgroup").as_deref() == Some(daemon.as_str()) {
+        return None;
+    }
+    let leaf = daemon.rsplit('/').next()?;
+    leaf.ends_with(".service").then(|| SystemdUnit {
+        name: leaf.to_string(),
+        user: daemon.contains("/user@"),
+    })
+}
+
+/// The cgroup v2 path (`0::<path>`) from a `/proc/<pid>/cgroup` file.
+#[cfg(unix)]
+fn unified_cgroup(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("0::").map(str::to_string))
+}
+
+/// Wait until `pid` has exited. A zombie (exited, not yet reaped by its
+/// parent) counts as exited: it holds no locks, sockets or ports.
+#[cfg(unix)]
+async fn wait_for_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Format: `<pid> (<comm>) <state> ...`; comm may contain spaces/parens.
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next());
+    !matches!(state, Some('Z') | Some('X') | None)
+}
+
 #[cfg(not(unix))]
-async fn daemon_restart(_client: ControlClient, _mode: &OutputMode) -> Result<ExitCode> {
+async fn daemon_restart(
+    _client: ControlClient,
+    _socket_override: Option<&std::path::Path>,
+    _mode: &OutputMode,
+) -> Result<ExitCode> {
     bail!(
         "daemon restart is only supported on unix; use the supervisor (systemd, launchd) instead"
     );
@@ -1095,17 +1217,6 @@ fn render_restart(value: &Value) -> Result<()> {
         str_at(value, "binary"),
     );
     Ok(())
-}
-
-#[cfg(unix)]
-fn client_socket_path(data_dir: &str) -> std::path::PathBuf {
-    use std::path::PathBuf;
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("mcpmux").join("control.sock");
-        }
-    }
-    PathBuf::from(data_dir).join("control.sock")
 }
 
 fn as_array(value: &Value) -> Vec<&Value> {

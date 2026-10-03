@@ -2787,6 +2787,7 @@ dependencies = [
  "clap",
  "libc",
  "mcpmux-control",
+ "mcpmux-gateway",
  "mcpmux-runtime",
  "serde",
  "serde_json",
