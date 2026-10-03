@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -86,6 +87,9 @@ pub struct RuntimeConfig {
     /// Whether to load the JWT signing secret at bootstrap. When `false`,
     /// `Runtime::jwt_secret` is `None` and token signing stays disabled.
     pub load_jwt_secret: bool,
+    /// How long to keep retrying while another process holds the data-dir
+    /// lock. Zero (the default) fails immediately.
+    pub lock_wait: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -102,6 +106,7 @@ impl Default for RuntimeConfig {
             server_log_max_files: DEFAULT_SERVER_LOG_MAX_FILES,
             server_log_compress: true,
             load_jwt_secret: true,
+            lock_wait: Duration::ZERO,
         }
     }
 }
@@ -157,6 +162,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Keep retrying for up to `wait` while another process holds the data
+    /// directory lock (see [`DataDirLock::acquire_with_wait`]).
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.config.lock_wait = wait;
+        self
+    }
+
     /// Run the bootstrap. Returns an `Arc<Runtime>` so both the desktop
     /// (which stores it in Tauri's state container) and the daemon (which
     /// awaits its own lifetime) can share one instance.
@@ -166,7 +178,7 @@ impl RuntimeBuilder {
 
         info!(path = %data_dir.display(), "[runtime] initialising");
 
-        let lock = DataDirLock::acquire(&data_dir)?;
+        let lock = DataDirLock::acquire_with_wait(&data_dir, config.lock_wait).await?;
 
         // Master key. Failures here are always operator-visible: a missing
         // keychain on a headless host is exactly the kind of problem the

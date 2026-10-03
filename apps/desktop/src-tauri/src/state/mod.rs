@@ -63,6 +63,11 @@ impl AppState {
         let runtime = tauri::async_runtime::block_on(async {
             mcpmux_runtime::RuntimeBuilder::new()
                 .with_data_dir(data_dir)
+                // After an in-place update the OS relaunches the new build
+                // before the old process has exited and released the lock;
+                // wait it out the same way gateway auto-start waits for the
+                // port instead of failing setup.
+                .with_lock_wait(mcpmux_core::service::AUTOSTART_PORT_WAIT)
                 .build()
                 .await
         })?;

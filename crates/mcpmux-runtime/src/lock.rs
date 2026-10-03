@@ -20,7 +20,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use tracing::{debug, info};
@@ -92,6 +92,37 @@ impl DataDirLock {
         info!(path = %path.display(), "[runtime] acquired data-directory lock");
 
         Ok(Self { file, path })
+    }
+
+    /// Like [`Self::acquire`], but keeps retrying for up to `wait` while
+    /// another process holds the lock, backing off between attempts.
+    ///
+    /// Covers the in-place self-update relaunch, where the OS starts the new
+    /// build before the old process has finished exiting and released its
+    /// lock. A holder that keeps the lock for the whole window still fails
+    /// with the usual lock-held error. A zero `wait` behaves like `acquire`.
+    pub async fn acquire_with_wait(data_dir: &Path, wait: Duration) -> Result<Self, RuntimeError> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut backoff = Duration::from_millis(50);
+        let mut logged = false;
+        loop {
+            match Self::acquire(data_dir) {
+                Err(e) if e.is_lock_held() && tokio::time::Instant::now() < deadline => {
+                    if !logged {
+                        info!(
+                            error = %e,
+                            "[runtime] data directory is locked; waiting up to {:?} for the holder to exit",
+                            wait
+                        );
+                        logged = true;
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::sleep(backoff.min(remaining)).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Path to the lockfile inside the data directory.
@@ -213,5 +244,32 @@ mod tests {
         assert_eq!(owner.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
 
         drop(lock1);
+    }
+
+    #[tokio::test]
+    async fn acquire_with_wait_succeeds_once_the_holder_releases() {
+        let dir = TempDir::new().unwrap();
+        let holder = DataDirLock::acquire(dir.path()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holder);
+        });
+
+        let lock = DataDirLock::acquire_with_wait(dir.path(), Duration::from_secs(5))
+            .await
+            .expect("lock acquired after the holder released it");
+        release.join().unwrap();
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn acquire_with_wait_gives_up_while_the_lock_stays_held() {
+        let dir = TempDir::new().unwrap();
+        let _holder = DataDirLock::acquire(dir.path()).unwrap();
+
+        let err = DataDirLock::acquire_with_wait(dir.path(), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(err.is_lock_held(), "expected lock-held error, got {err:?}");
     }
 }
