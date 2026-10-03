@@ -918,6 +918,14 @@ async fn servers_add_configure_enable_and_feature_set_membership() {
     .await;
     assert!(enabled.ok, "servers.enable failed: {:?}", enabled.error);
     assert_eq!(enabled.data.unwrap()["status"], "connected");
+    let connected = |id: &'static str| {
+        let socket = socket.clone();
+        async move {
+            let status = call(&socket, &request(id, "status")).await;
+            status.data.unwrap()["connected_servers"].as_u64().unwrap()
+        }
+    };
+    assert_eq!(connected("st1").await, 1);
 
     let features = call(
         &socket,
@@ -976,6 +984,23 @@ async fn servers_add_configure_enable_and_feature_set_membership() {
         "feature-sets.remove-member failed: {:?}",
         removed.error
     );
+
+    // Removing the server must also drop it from the connected count.
+    let uninstalled = call(
+        &socket,
+        &request_with(
+            "x1",
+            "servers.remove",
+            serde_json::json!({"server_id": "community.memory-npx"}),
+        ),
+    )
+    .await;
+    assert!(
+        uninstalled.ok,
+        "servers.remove failed: {:?}",
+        uninstalled.error
+    );
+    assert_eq!(connected("st2").await, 0);
 
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);

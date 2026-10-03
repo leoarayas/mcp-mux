@@ -1284,6 +1284,12 @@ async fn servers_remove(
         .oauth_manager()
         .cancel_flow_for_space(space, &p.server_id);
 
+    // Same teardown as `servers_disable`: otherwise the ServerManager keeps
+    // reporting the removed server as connected until the daemon restarts.
+    let key = ServerKey::new(space, p.server_id.clone());
+    state.server_manager.set_disconnected(&key).await;
+    mark_unavailable(state, space, &p.server_id).await;
+
     state
         .server_app_service()
         .uninstall(space, &p.server_id)
