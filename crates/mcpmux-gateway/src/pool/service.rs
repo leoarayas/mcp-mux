@@ -73,6 +73,11 @@ pub struct PoolStats {
     pub oauth_pending_instances: usize,
 }
 
+/// Upper bound on [`PoolService::shutdown`]'s graceful close. Together with
+/// the ~2s gateway drain that follows it, this keeps desktop exit inside the
+/// ~2.5s it may block before Windows reports the app as not responding.
+pub const POOL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Pool Service - main orchestrator for server connections
 pub struct PoolService {
     /// Active server instances keyed by (space_id, server_id)
@@ -393,33 +398,55 @@ impl PoolService {
     /// particular, closing a stdio connection releases its process transport;
     /// on Windows that terminates the whole Job Object, including descendants
     /// created by wrappers such as `npx`.
+    ///
+    /// Bounded by [`POOL_SHUTDOWN_TIMEOUT`]: every caller (app exit, gateway
+    /// stop/restart, daemon shutdown) awaits this before the gateway's own
+    /// ~2s drain, so one server that never acknowledges the close must not
+    /// stall them. Connections still closing at the deadline are dropped;
+    /// stdio children are spawned kill-on-drop, so they are terminated then.
     pub async fn shutdown(&self) {
         // Admit no further connections before draining, so nothing can be
         // inserted (and spawned) behind the snapshot below.
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        // Drain repeatedly. A `connect_server` already past the flag check can
-        // still insert and spawn while we await the first batch; sweep again
-        // until the map stays empty.
-        let mut total = 0usize;
-        loop {
-            let instances: Vec<Arc<ServerInstance>> = self
-                .instances
-                .iter()
-                .map(|entry| Arc::clone(entry.value()))
-                .collect();
-            if instances.is_empty() {
-                break;
+        let total = std::sync::atomic::AtomicUsize::new(0);
+        let drain = async {
+            // Drain repeatedly. A `connect_server` already past the flag check
+            // can still insert and spawn while we await the first batch;
+            // sweep again until the map stays empty.
+            loop {
+                let instances: Vec<Arc<ServerInstance>> = self
+                    .instances
+                    .iter()
+                    .map(|entry| Arc::clone(entry.value()))
+                    .collect();
+                if instances.is_empty() {
+                    break;
+                }
+                total.fetch_add(instances.len(), std::sync::atomic::Ordering::Relaxed);
+                self.instances.clear();
+                futures::future::join_all(instances.iter().map(|instance| instance.shutdown()))
+                    .await;
             }
-            total += instances.len();
+        };
+
+        if tokio::time::timeout(POOL_SHUTDOWN_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            // Dropping the timed-out drain drops the in-flight connections;
+            // also release anything inserted while it ran.
             self.instances.clear();
-            futures::future::join_all(instances.iter().map(|instance| instance.shutdown())).await;
+            warn!(
+                "[PoolService] Backend connections did not close within {:?}; dropped the rest",
+                POOL_SHUTDOWN_TIMEOUT
+            );
         }
 
         info!(
             "[PoolService] Released {} backend connection(s) for gateway shutdown",
-            total
+            total.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 
