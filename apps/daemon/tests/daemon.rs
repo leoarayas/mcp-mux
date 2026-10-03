@@ -121,6 +121,74 @@ async fn daemon_serves_health_and_stops_cleanly_on_sigterm() {
     assert!(status.success(), "mcpmuxd exited with {status}");
 }
 
+/// Another process already answering `/health` with 200 on the daemon's port
+/// must not be mistaken for the daemon's own gateway: the daemon has to fail
+/// to start instead of reporting ready without a listener.
+#[tokio::test]
+async fn daemon_refuses_to_start_when_port_is_owned_by_another_process() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let squatter_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = squatter.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let port_arg = port.to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mcpmuxd"))
+        .args([
+            "--data-dir",
+            data_dir.path().to_str().unwrap(),
+            "--key-provider",
+            "file",
+            "--port",
+            &port_arg,
+        ])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .spawn()
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(25)).await;
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("mcpmuxd kept running although its gateway port was taken");
+            }
+        }
+    };
+    squatter_task.abort();
+
+    assert!(!status.success(), "mcpmuxd must exit non-zero, got {status}");
+    assert!(
+        !socket_path(runtime_dir.path()).exists(),
+        "control socket must not be published without a gateway"
+    );
+}
+
 #[tokio::test]
 async fn control_socket_answers_ping_and_status() {
     let data_dir = tempfile::tempdir().unwrap();

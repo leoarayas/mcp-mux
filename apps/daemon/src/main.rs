@@ -146,7 +146,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let _event_bridge =
         mcpmux_runtime::spawn_event_bridge(runtime.event_bus.clone(), gateway_state.clone()).await;
 
-    let handle = server.spawn();
+    let mut handle = server.spawn();
+
+    // Fail on our own bind result: a /health 200 alone could come from
+    // another process (e.g. the desktop app) already owning this port.
+    if let Err(e) = handle.wait_until_bound().await {
+        error!(error = %e, "[mcpmuxd] gateway failed to bind");
+        shutdown_pool_service.shutdown().await;
+        shutdown_gateway_handle(handle).await;
+        shutdown_task.abort();
+        return Err(anyhow::anyhow!(
+            "gateway failed to bind {bind_host}:{preferred_port}: {e} \
+             (is the McpMux desktop app or another mcpmuxd already using this port?)"
+        ));
+    }
 
     // Persist the auth-disabled flag when --auth-disabled was passed.
     // Phase 2 will move this to a dedicated `mcpmux config` invocation;
