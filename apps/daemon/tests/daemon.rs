@@ -182,7 +182,10 @@ async fn daemon_refuses_to_start_when_port_is_owned_by_another_process() {
     };
     squatter_task.abort();
 
-    assert!(!status.success(), "mcpmuxd must exit non-zero, got {status}");
+    assert!(
+        !status.success(),
+        "mcpmuxd must exit non-zero, got {status}"
+    );
     assert!(
         !socket_path(runtime_dir.path()).exists(),
         "control socket must not be published without a gateway"
