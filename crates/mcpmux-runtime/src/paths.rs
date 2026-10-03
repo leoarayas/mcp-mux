@@ -56,9 +56,16 @@ pub fn default_data_dir() -> PathBuf {
 /// Resolve and validate the data directory for the runtime.
 ///
 /// `override_path` (typically the `--data-dir` flag) wins when `Some`.
-/// Otherwise the XDG default is used. The path is converted to an absolute
-/// canonical form (resolving `..`, symlinks where the OS allows) so the
-/// lockfile path is stable regardless of how the operator launched us.
+/// Otherwise the XDG default is used. A relative path is joined onto the
+/// current directory; an absolute path is returned verbatim.
+///
+/// The path is deliberately NOT canonicalized. Stored rows embed it (e.g.
+/// `user_config:<data_dir>/spaces/<id>.json` installation sources) and are
+/// matched by exact string, so it must stay identical to what earlier
+/// versions wrote. Canonicalizing would also yield a `\\?\C:\...` verbatim
+/// path on Windows and differ between the first run (directory missing)
+/// and later runs. The data-dir lock does not need it: the kernel lock is
+/// per file, whatever spelling of the path opened it.
 pub fn resolve_data_dir(override_path: Option<&Path>) -> Result<PathBuf, RuntimeError> {
     let raw = match override_path {
         Some(p) => p.to_path_buf(),
@@ -72,20 +79,16 @@ pub fn resolve_data_dir(override_path: Option<&Path>) -> Result<PathBuf, Runtime
         });
     }
 
-    let abs = if raw.is_absolute() {
-        raw.clone()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| RuntimeError::InvalidDataDir {
-                path: raw.clone(),
-                reason: format!("could not resolve relative path: {}", e),
-            })?
-            .join(&raw)
-    };
+    if raw.is_absolute() {
+        return Ok(raw);
+    }
 
-    let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
-
-    Ok(canonical)
+    Ok(std::env::current_dir()
+        .map_err(|e| RuntimeError::InvalidDataDir {
+            path: raw.clone(),
+            reason: format!("could not resolve relative path: {}", e),
+        })?
+        .join(&raw))
 }
 
 /// Directory holding the daemon's control socket: `$XDG_RUNTIME_DIR/mcpmux`.
@@ -165,6 +168,22 @@ mod tests {
         let _environment = environment_lock();
         let err = resolve_data_dir(Some(Path::new(""))).unwrap_err();
         assert!(matches!(err, RuntimeError::InvalidDataDir { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_data_dir_is_kept_verbatim_not_canonicalized() {
+        let _environment = environment_lock();
+        let target = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("data-link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        // Existing directory reached through a symlink: still the same string.
+        assert_eq!(resolve_data_dir(Some(&link)).unwrap(), link);
+        // Missing directory: same rule, so first and later runs agree.
+        let missing = links.path().join("not-created-yet");
+        assert_eq!(resolve_data_dir(Some(&missing)).unwrap(), missing);
     }
 
     #[test]
