@@ -2741,7 +2741,6 @@ dependencies = [
  "async-trait",
  "hex",
  "mcpmux-core",
- "process-wrap",
  "reqwest 0.13.2",
  "ring",
  "rmcp",
@@ -2751,7 +2750,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "windows 0.62.2",
 ]
 
 [[package]]

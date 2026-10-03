@@ -3,8 +3,8 @@
 Technical record of how McpMux launches stdio MCP servers on Windows, why the
 obvious approach does not work, and how to verify changes to it.
 
-Scope: `crates/mcpmux-gateway/src/pool/transport/stdio.rs` and the equivalent
-spawn in `crates/mcpmux-mcp/src/transports.rs`.
+Scope: `crates/mcpmux-gateway/src/pool/transport/stdio.rs`. (`mcpmux-mcp` has
+its own spawn, but no shipped binary depends on that crate, so it is unchanged.)
 
 ## The symptom
 
@@ -117,13 +117,17 @@ processes outlive the gateway:
 `restart_gateway` originally only took the server handle. The old pool is kept
 alive by an `Arc` held by the detached OAuth handler in `init_gateway_runtime`,
 so without an explicit pool shutdown every restart leaked the previous stdio
-processes while starting a second set. All three paths now call
-`PoolService::shutdown()`.
+processes while starting a second set. All three paths now go through
+`shutdown_gateway_runtime()`, which closes the listener and runs
+`PoolService::shutdown()` concurrently. Both are time-bounded (each client close
+1.5s, the whole drain 2s, the listener 2s) so the exit path stays inside the
+~2.5s Windows allows before showing "not responding".
 
 `PoolService::shutdown()` also guards against being raced by `connect_server`: a
-`shutting_down` flag gates new connections, the drain loops until the instance
-map stays empty, and a connection that completes during a shutdown reaps its own
-instance.
+`shutting_down` flag gates new connections (including `reconnect_instance`), the
+drain closes established connections first, then waits on every connect lock so
+in-flight connects finish, then sweeps again. A connection that completes during
+a shutdown reaps its own instance.
 
 When verifying orphan behaviour, exercise **restart** as well as quit. A
 shutdown-path fix can look correct if only the quit path is tested.
@@ -170,19 +174,11 @@ print(sorted(d.get("target", {}).get("cfg(windows)", {}).get("dependencies", {})
 # expected: ['process-wrap', 'windows']
 ```
 
-## Related CI failure
-
-`cargo clippy --workspace -- -D warnings` currently fails on `main` with 80
-`clippy::double_must_use` errors in `crates/mcpmux-core/src/repository/mod.rs`.
-The GitHub runner moved to Rust 1.99 and the lint now fires on the existing
-`#[async_trait]` repository traits. It is unrelated to this work; it needs a
-separate fix (pin the toolchain, or allow the lint on those traits).
-
 ## Known follow-ups
 
-- The Windows job implementation is duplicated between `mcpmux-gateway` and
-  `mcpmux-mcp` rather than routed through the shared
-  `configure_child_process_platform()` helper that `AGENTS.md` mandates.
-  Extracting it is a worthwhile separate change.
-- `process-wrap` is declared as `process-wrap = "9"` in the workspace root while
+- On macOS/Linux a forced kill still only signals the root process; the
+  `process_group(0)` group is never signalled as a whole. Wrapping the Unix
+  spawn in process-wrap's `ProcessGroup::leader()` would give the same tree kill
+  there.
+- `process-wrap` is declared in the workspace root while
   the crates also pin `windows = "0.62.2"` directly. Worth consolidating.

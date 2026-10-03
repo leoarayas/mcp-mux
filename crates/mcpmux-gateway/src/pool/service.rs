@@ -10,7 +10,7 @@
 //! - Bulk connect on startup (reconnect_all_enabled)
 //! - Providing access to server instances for routing
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -283,9 +283,9 @@ impl PoolService {
             .clone();
         let _connect_guard = connect_lock.lock().await;
 
-        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.is_shutting_down() {
             return ConnectionResult::Failed {
-                error: "Pool is shutting down".to_string(),
+                error: "Gateway is stopping or stopped".to_string(),
             };
         }
 
@@ -365,11 +365,12 @@ impl PoolService {
         instance: &Arc<ServerInstance>,
         result: ConnectionResult,
     ) -> ConnectionResult {
-        if !self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.is_shutting_down() {
             return result;
         }
         instance.shutdown().await;
-        self.instances.remove(key);
+        self.instances
+            .remove_if(key, |_, current| Arc::ptr_eq(current, instance));
         ConnectionResult::Failed {
             error: "Pool shut down while this connection was being established".to_string(),
         }
@@ -387,6 +388,12 @@ impl PoolService {
         }
     }
 
+    /// Whether [`PoolService::shutdown`] has begun. A shut-down pool never
+    /// admits connections again; the next gateway start builds a new one.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// Close every live backend connection without changing persisted credentials.
     ///
     /// This is used when the gateway stops or the desktop app exits. In
@@ -394,33 +401,54 @@ impl PoolService {
     /// on Windows that terminates the whole Job Object, including descendants
     /// created by wrappers such as `npx`.
     pub async fn shutdown(&self) {
-        // Admit no further connections before draining, so nothing can be
-        // inserted (and spawned) behind the snapshot below.
-        self.shutting_down
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Admit no further connections before draining, so nothing new can be
+        // inserted (and spawned) behind the sweeps below.
+        self.shutting_down.store(true, Ordering::SeqCst);
 
-        // Drain repeatedly. A `connect_server` already past the flag check can
-        // still insert and spawn while we await the first batch; sweep again
-        // until the map stays empty.
-        let mut total = 0usize;
-        loop {
-            let instances: Vec<Arc<ServerInstance>> = self
-                .instances
-                .iter()
-                .map(|entry| Arc::clone(entry.value()))
-                .collect();
-            if instances.is_empty() {
-                break;
-            }
-            total += instances.len();
-            self.instances.clear();
-            futures::future::join_all(instances.iter().map(|instance| instance.shutdown())).await;
+        // Close established connections first, so waiting on a slow in-flight
+        // connect below can never delay them past a caller's timeout.
+        let mut total = self.drain_instances().await;
+
+        // Wait for connects that were already past the flag check. Each holds
+        // its key's lock until it has reaped its own instance
+        // (`reap_if_shutting_down`), so once every lock has been acquired none
+        // is still spawning. Locks created after the flag was set belong to
+        // callers that will see it and bail.
+        let locks: Vec<_> = self
+            .connect_locks
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        for lock in locks {
+            drop(lock.lock().await);
         }
+
+        // Anything inserted between the first sweep and those connects ending.
+        total += self.drain_instances().await;
 
         info!(
             "[PoolService] Released {} backend connection(s) for gateway shutdown",
             total
         );
+    }
+
+    /// Remove and close every instance currently in the map.
+    ///
+    /// Removes key by key rather than `clear()`ing: an instance inserted after
+    /// the snapshot stays in the map for the next sweep instead of being
+    /// dropped without an awaited shutdown.
+    async fn drain_instances(&self) -> usize {
+        let keys: Vec<_> = self
+            .instances
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let instances: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.instances.remove(key).map(|(_, instance)| instance))
+            .collect();
+        futures::future::join_all(instances.iter().map(|instance| instance.shutdown())).await;
+        instances.len()
     }
 
     /// Disconnect a server (logout - clears tokens but keeps DCR)
@@ -487,6 +515,12 @@ impl PoolService {
     pub async fn reconnect_instance(&self, space_id: Uuid, server_id: &str) -> ConnectionResult {
         let key = (space_id, server_id.to_string());
 
+        if self.is_shutting_down() {
+            return ConnectionResult::Failed {
+                error: "Gateway is stopping or stopped".to_string(),
+            };
+        }
+
         // Get existing instance
         let instance = match self.instances.get(&key) {
             Some(inst) => inst.clone(),
@@ -507,9 +541,13 @@ impl PoolService {
         );
 
         // Reconnect using connection service with OAuth tokens
-        self.connection_service
+        let result = self
+            .connection_service
             .reconnect_after_oauth(space_id, server_id, &instance, &self.feature_service)
-            .await
+            .await;
+        // Not serialized with shutdown() via the connect lock, so a reconnect
+        // that finishes after the drain closes its own client here.
+        self.reap_if_shutting_down(&key, &instance, result).await
     }
 
     /// Disconnect all servers in a space
