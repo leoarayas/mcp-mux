@@ -26,9 +26,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[cfg(windows)]
-use process_wrap::tokio::{CommandWrap, CreationFlags, KillOnDrop};
-#[cfg(windows)]
-use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
 
 use super::shell_env;
 use super::TransportType;
@@ -77,7 +75,7 @@ mod job_tree {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
@@ -85,23 +83,41 @@ mod job_tree {
     #[derive(Debug)]
     pub struct JobTree;
 
-    /// Raw job handle. `HANDLE` is not `Send`, but moving one between threads
-    /// is sound; process-wrap marks its equivalent newtype the same way.
-    #[derive(Debug, Clone, Copy)]
-    struct JobHandle(HANDLE);
-
-    unsafe impl Send for JobHandle {}
-    unsafe impl Sync for JobHandle {}
-
     /// Owns the job handle: closing it terminates every process in the job.
+    ///
+    /// `HANDLE` is not `Send`, but moving one between threads is sound;
+    /// process-wrap marks its equivalent newtype the same way.
     #[derive(Debug)]
-    struct JobOwner(JobHandle);
+    struct JobOwner(HANDLE);
+
+    unsafe impl Send for JobOwner {}
+    unsafe impl Sync for JobOwner {}
+
+    impl JobOwner {
+        fn new_kill_on_close() -> io::Result<Self> {
+            // Owned from the moment it exists, so every early return below
+            // (and in `wrap_child`) closes it instead of leaking it.
+            let job = JobOwner(unsafe { CreateJobObjectW(None, None)? });
+
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )?;
+            }
+            Ok(job)
+        }
+    }
 
     impl Drop for JobOwner {
         fn drop(&mut self) {
             // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE tears down the whole tree here.
             unsafe {
-                let _ = CloseHandle(self.0 .0);
+                let _ = CloseHandle(self.0);
             }
         }
     }
@@ -129,6 +145,12 @@ mod job_tree {
             std::mem::forget(this.job);
             this.inner.into_inner()
         }
+
+        /// Terminate the whole tree, not just the root process, mirroring
+        /// process-wrap's own `JobObjectChild::start_kill`.
+        fn start_kill(&mut self) -> io::Result<()> {
+            unsafe { TerminateJobObject(self.job.0, 1) }.map_err(io::Error::other)
+        }
     }
 
     impl CommandWrapper for JobTree {
@@ -147,48 +169,18 @@ mod job_tree {
             inner: Box<dyn ChildWrapper>,
             _core: &CommandWrap,
         ) -> io::Result<Box<dyn ChildWrapper>> {
-            let job = unsafe { create_kill_on_close_job()? };
+            let job = JobOwner::new_kill_on_close()?;
 
-            let handle = inner
+            let process = inner
                 .inner_child()
                 .raw_handle()
                 .ok_or_else(|| io::Error::other("spawned child has no process handle"))?;
 
-            let process = HANDLE(handle);
-            if let Err(e) = unsafe { AssignProcessToJobObject(job.0, process) } {
-                drop(JobOwner(job));
-                return Err(io::Error::other(format!(
-                    "AssignProcessToJobObject failed: {e}"
-                )));
-            }
+            unsafe { AssignProcessToJobObject(job.0, HANDLE(process)) }
+                .map_err(|e| io::Error::other(format!("AssignProcessToJobObject failed: {e}")))?;
 
-            Ok(Box::new(JobTreeChild {
-                inner,
-                job: JobOwner(job),
-            }))
+            Ok(Box::new(JobTreeChild { inner, job }))
         }
-    }
-
-    unsafe fn create_kill_on_close_job() -> io::Result<JobHandle> {
-        // Wrap the handle immediately so the `?` below still closes it if
-        // configuring the job fails; otherwise every retry leaks one handle.
-        let owned = JobOwner(JobHandle(CreateJobObjectW(None, None)?));
-
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-        SetInformationJobObject(
-            owned.0 .0,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )?;
-
-        // Success: hand the raw handle to the caller, which wraps it in its
-        // own `JobOwner` once the child has been attached.
-        let handle = owned.0;
-        std::mem::forget(owned);
-        Ok(handle)
     }
 }
 
@@ -203,15 +195,13 @@ fn stdio_child_command(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> CommandWrap {
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
     let mut command = CommandWrap::with_new(command_path, |cmd| {
         cmd.args(args).envs(env);
+        // Sets CREATE_NO_WINDOW. It must stay the *only* console-related flag:
+        // adding CREATE_SUSPENDED (as process-wrap's JobObject does) brings
+        // the terminal window back, which is why `job_tree` exists.
+        configure_child_process_platform(cmd);
     });
-    // CREATE_NO_WINDOW must be the *only* console-related flag: it is the sole
-    // thing suppressing the terminal window, and adding CREATE_SUSPENDED (as
-    // process-wrap's JobObject does) brings the window back.
-    command.wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)));
     command.wrap(KillOnDrop);
     command.wrap(job_tree::JobTree);
     command
@@ -537,7 +527,6 @@ mod tests {
     fn stdio_child_command_contains_windows_tree_containment() {
         let command = stdio_child_command(std::path::Path::new("cmd.exe"), &[], &HashMap::new());
 
-        assert!(command.has_wrap::<CreationFlags>());
         assert!(command.has_wrap::<KillOnDrop>());
         assert!(command.has_wrap::<job_tree::JobTree>());
     }
