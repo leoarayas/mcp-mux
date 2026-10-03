@@ -80,8 +80,9 @@ the Tauri-only interaction flows around it.
 ### Process and paths
 
 - `mcpmuxd` is the only writer to a live data directory.
-- `mcpmux-cli` connects to `$XDG_RUNTIME_DIR/mcpmux/control.sock`; the socket is
-  owned by the service user and mode `0600`.
+- `mcpmux-cli` connects to `$XDG_RUNTIME_DIR/mcpmux/<data-dir-id>/control.sock`
+  (one socket per data directory); the socket is owned by the service user and
+  mode `0600`.
 - Default persistent data is `$XDG_STATE_HOME/mcpmux` (normally
   `~/.local/state/mcpmux`), configurable via `--data-dir`.
 - Logs go to journald by default. `--log-dir` may enable rotating files for

@@ -108,7 +108,7 @@ PR lands by `cargo tree -p mcpmux-runtime | grep tauri`.
 | Runtime crate | `mcpmux-runtime` |
 | Control protocol crate | `mcpmux-control` |
 | systemd unit | `mcpmux.service` |
-| Control socket | `$XDG_RUNTIME_DIR/mcpmux/control.sock` (0600) |
+| Control socket | `$XDG_RUNTIME_DIR/mcpmux/<data-dir-id>/control.sock` (0600), one per data directory |
 | Data dir | `$XDG_STATE_HOME/mcpmux` (or `--data-dir`) |
 | Logs dir | `<data-dir>/logs` (or `--log-dir`) |
 | Default port | `127.0.0.1:45818` (existing `DEFAULT_GATEWAY_PORT`) |

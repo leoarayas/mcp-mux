@@ -44,7 +44,7 @@ async fn spawn_daemon_with(data_dir: &Path, runtime_dir: &Path, extra: &[&str]) 
         .spawn()
         .unwrap();
 
-    let socket = runtime_dir.join("mcpmux").join("control.sock");
+    let socket = socket_path(runtime_dir, data_dir);
     let ready = timeout(Duration::from_secs(10), async {
         loop {
             if socket.exists() && UnixStream::connect(&socket).await.is_ok() {
@@ -73,8 +73,11 @@ async fn call(socket_path: &Path, request: &RequestEnvelope) -> ResponseEnvelope
     read_frame(&mut reader).await.unwrap()
 }
 
-fn socket_path(runtime_dir: &Path) -> std::path::PathBuf {
-    runtime_dir.join("mcpmux").join("control.sock")
+/// The control socket a daemon with `XDG_RUNTIME_DIR=runtime_dir` and
+/// `--data-dir data_dir` binds.
+fn socket_path(runtime_dir: &Path, data_dir: &Path) -> std::path::PathBuf {
+    mcpmux_runtime::control_dir_under(Some(runtime_dir.to_path_buf()), data_dir)
+        .join("control.sock")
 }
 
 fn request(request_id: &str, method: &str) -> RequestEnvelope {
@@ -193,9 +196,37 @@ async fn daemon_refuses_to_start_when_port_is_owned_by_another_process() {
         "mcpmuxd must exit non-zero, got {status}"
     );
     assert!(
-        !socket_path(runtime_dir.path()).exists(),
+        !socket_path(runtime_dir.path(), data_dir.path()).exists(),
         "control socket must not be published without a gateway"
     );
+}
+
+/// Two daemons with different data dirs (and ports) under one
+/// `XDG_RUNTIME_DIR` must each get their own control socket.
+#[tokio::test]
+async fn daemons_with_different_data_dirs_get_separate_sockets() {
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_a = tempfile::tempdir().unwrap();
+    let data_b = tempfile::tempdir().unwrap();
+    let (mut a, _) = spawn_daemon(data_a.path(), runtime_dir.path()).await;
+    let (mut b, _) = spawn_daemon(data_b.path(), runtime_dir.path()).await;
+
+    for (child, data_dir) in [(&a, data_a.path()), (&b, data_b.path())] {
+        let status = call(
+            &socket_path(runtime_dir.path(), data_dir),
+            &request("s1", "status"),
+        )
+        .await;
+        assert!(status.ok, "status failed: {:?}", status.error);
+        assert_eq!(status.data.unwrap()["pid"], child.id());
+    }
+
+    for child in [&mut a, &mut b] {
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = child.wait();
+    }
 }
 
 #[tokio::test]
@@ -203,7 +234,7 @@ async fn control_socket_answers_ping_and_status() {
     let data_dir = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
-    let socket = socket_path(runtime_dir.path());
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
 
     let pong = call(&socket, &request("p1", "ping")).await;
     assert!(pong.ok, "ping failed: {:?}", pong.error);
@@ -227,7 +258,11 @@ async fn control_socket_answers_ping_and_status() {
 async fn auth_disabled_flag_is_not_persisted_across_restarts() {
     async fn auth_disabled_reported(data_dir: &Path, runtime_dir: &Path, extra: &[&str]) -> bool {
         let (mut child, _port) = spawn_daemon_with(data_dir, runtime_dir, extra).await;
-        let status = call(&socket_path(runtime_dir), &request("s1", "status")).await;
+        let status = call(
+            &socket_path(runtime_dir, data_dir),
+            &request("s1", "status"),
+        )
+        .await;
         unsafe {
             libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
         }
@@ -249,7 +284,7 @@ async fn config_import_round_trips_a_space() {
     let data_dir = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
-    let socket = socket_path(runtime_dir.path());
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
 
     // Write a portable mcpServers document with one stdio server.
     let import_file = data_dir.path().join("import.json");
@@ -327,7 +362,7 @@ async fn doctor_reports_core_checks() {
     let data_dir = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
-    let socket = socket_path(runtime_dir.path());
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
 
     let response = call(&socket, &request("d1", "doctor")).await;
     assert!(response.ok, "doctor failed: {:?}", response.error);
@@ -384,7 +419,7 @@ async fn registry_list_returns_cached_catalog() {
     let data_dir = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
-    let socket = socket_path(runtime_dir.path());
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
 
     let listed = call(
         &socket,
@@ -420,7 +455,7 @@ async fn control_socket_rejects_incompatible_version_and_unknown_method() {
     let data_dir = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
-    let socket = socket_path(runtime_dir.path());
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
 
     let mut bad_version = request("v1", "ping");
     bad_version.version = PROTOCOL_VERSION + 1;
@@ -444,7 +479,7 @@ async fn control_socket_streams_events_after_subscribe_ack() {
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
 
-    let stream = UnixStream::connect(socket_path(runtime_dir.path()))
+    let stream = UnixStream::connect(socket_path(runtime_dir.path(), data_dir.path()))
         .await
         .unwrap();
     let (read_half, mut write_half) = stream.into_split();
@@ -457,7 +492,7 @@ async fn control_socket_streams_events_after_subscribe_ack() {
     assert!(ack.ok, "subscribe failed: {:?}", ack.error);
 
     // Mutating via a second connection must appear on the event stream.
-    let other = UnixStream::connect(socket_path(runtime_dir.path()))
+    let other = UnixStream::connect(socket_path(runtime_dir.path(), data_dir.path()))
         .await
         .unwrap();
     let (other_read, mut other_write) = other.into_split();
@@ -518,7 +553,7 @@ async fn servers_add_configure_enable_and_feature_set_membership() {
     let data_dir = tempfile::tempdir().unwrap();
     let runtime_dir = tempfile::tempdir().unwrap();
     let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
-    let socket = socket_path(runtime_dir.path());
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
 
     // Register an API-key client: the key it returns must be usable as a
     // Bearer token, which is what proves the CLI and gateway agree on key

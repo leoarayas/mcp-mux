@@ -1,6 +1,6 @@
 //! Unix control-socket server.
 //!
-//! Binds `$XDG_RUNTIME_DIR/mcpmux/control.sock` (`0700` directory, `0600`
+//! Binds `$XDG_RUNTIME_DIR/mcpmux/<data-dir-id>/control.sock` (`0700` directory, `0600`
 //! socket), authenticates the connecting peer by Unix UID, and serves the
 //! versioned JSON protocol in `mcpmux-control`. The socket is never exposed
 //! over the network; it is a local IPC surface only.

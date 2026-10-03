@@ -91,16 +91,30 @@ pub fn resolve_data_dir(override_path: Option<&Path>) -> Result<PathBuf, Runtime
         .join(&raw))
 }
 
-/// Directory holding the daemon's control socket: `$XDG_RUNTIME_DIR/mcpmux`.
+/// Directory holding the daemon's control socket:
+/// `$XDG_RUNTIME_DIR/mcpmux/<data-dir-id>`.
 ///
 /// `XDG_RUNTIME_DIR` is the correct home for a user-scoped, non-persistent
 /// socket — it is created by systemd-logind with `0700` permissions and is
-/// cleared on logout. When it is unset (unusual on a systemd host, possible
-/// in a bare SSH session), fall back to `<data_dir>/run` so the daemon and
-/// CLI still agree on a single path.
+/// cleared on logout. `<data-dir-id>` is a stable hash of the data directory,
+/// so daemons with different `--data-dir` values get separate sockets and a
+/// CLI given `--data-dir X` reaches the daemon that owns `X`. When the
+/// variable is unset (possible in a bare SSH session), fall back to
+/// `<data_dir>/run`, which is per data directory already.
 pub fn control_dir(data_dir: &Path) -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(rt) if !rt.is_empty() => PathBuf::from(rt).join(DATA_DIR_NAME),
+    control_dir_under(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        data_dir,
+    )
+}
+
+/// [`control_dir`] with an explicit runtime directory instead of reading
+/// `XDG_RUNTIME_DIR` (`None` or empty selects the `<data_dir>/run` fallback).
+pub fn control_dir_under(runtime_dir: Option<PathBuf>, data_dir: &Path) -> PathBuf {
+    match runtime_dir {
+        Some(rt) if !rt.as_os_str().is_empty() => rt
+            .join(DATA_DIR_NAME)
+            .join(format!("{:016x}", data_dir_id(data_dir))),
         _ => data_dir.join("run"),
     }
 }
@@ -108,6 +122,19 @@ pub fn control_dir(data_dir: &Path) -> PathBuf {
 /// Path to the daemon control socket: `<control_dir>/control.sock`.
 pub fn control_socket_path(data_dir: &Path) -> PathBuf {
     control_dir(data_dir).join("control.sock")
+}
+
+/// Stable 64-bit FNV-1a hash of the data directory. Spelled out rather than
+/// `DefaultHasher` so a CLI and a daemon from different builds agree. The
+/// path is normalized first so `/x/` and `/x` map to the same socket.
+fn data_dir_id(data_dir: &Path) -> u64 {
+    let normalized: PathBuf = data_dir.components().collect();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in normalized.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -194,11 +221,22 @@ mod tests {
             std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         }
         let data_dir = Path::new("/var/lib/mcpmux");
-        assert_eq!(
-            control_socket_path(data_dir),
-            PathBuf::from("/run/user/1000/mcpmux/control.sock")
-        );
+        let socket = control_socket_path(data_dir);
+        assert!(socket.starts_with("/run/user/1000/mcpmux/"), "{socket:?}");
+        assert!(socket.ends_with("control.sock"));
         restore_environment_variable("XDG_RUNTIME_DIR", previous);
+    }
+
+    #[test]
+    fn control_socket_is_per_data_dir_and_stable() {
+        let rt = Some(PathBuf::from("/run/user/1000"));
+        let a = control_dir_under(rt.clone(), Path::new("/srv/a"));
+        let b = control_dir_under(rt.clone(), Path::new("/srv/b"));
+        assert_ne!(a, b, "different data dirs must not share a socket");
+        assert_eq!(a, control_dir_under(rt.clone(), Path::new("/srv/a/")));
+        // Pinned value (FNV-1a of "/srv/a"): a CLI and a daemon from
+        // different builds must agree, so the hash must never change.
+        assert_eq!(a, PathBuf::from("/run/user/1000/mcpmux/39aff565700eaeb7"));
     }
 
     #[test]

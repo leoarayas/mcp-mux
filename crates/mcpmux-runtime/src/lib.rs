@@ -28,6 +28,7 @@ pub use init::{
 pub use lock::DataDirLock;
 pub use logging::{default_filter, init_tracing, LogSink, TracingConfig};
 pub use paths::{
-    control_dir, control_socket_path, default_data_dir, resolve_data_dir, DATA_DIR_NAME,
+    control_dir, control_dir_under, control_socket_path, default_data_dir, resolve_data_dir,
+    DATA_DIR_NAME,
 };
 pub use shutdown::{shutdown_gateway_handle, wait_for_shutdown};

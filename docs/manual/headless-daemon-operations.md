@@ -135,8 +135,10 @@ Verify the health endpoint afterward.
 ## Adding an MCP server by CLI
 
 The `mcpmux-cli` operator CLI talks to the running daemon over a local Unix
-control socket (`$XDG_RUNTIME_DIR/mcpmux/control.sock`, mode `0600`). It never
-opens `mcpmux.db` directly, so the in-memory gateway state, domain events,
+control socket (`$XDG_RUNTIME_DIR/mcpmux/<data-dir-id>/control.sock`, mode
+`0600`, where `<data-dir-id>` is a hash of the daemon's `--data-dir`, so pass
+the CLI the same `--data-dir` as the daemon when it is not the default). It
+never opens `mcpmux.db` directly, so the in-memory gateway state, domain events,
 encryption flow, and exclusive-lock discipline are always respected. The CLI
 requires the daemon to be running; if the socket is absent it exits with an
 actionable error instead of touching storage.

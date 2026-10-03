@@ -162,11 +162,10 @@ pub fn resolve_socket_path(data_dir: Option<&Path>, socket: Option<&Path>) -> Re
     if let Some(path) = socket {
         return Ok(path.to_path_buf());
     }
-    let data_dir = match data_dir {
-        Some(dir) => mcpmux_runtime::resolve_data_dir(Some(dir))
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-        None => mcpmux_runtime::default_data_dir(),
-    };
+    // Same resolution as the daemon's RuntimeBuilder, so the per-data-dir
+    // socket path matches.
+    let data_dir =
+        mcpmux_runtime::resolve_data_dir(data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(mcpmux_runtime::control_socket_path(&data_dir))
 }
 
