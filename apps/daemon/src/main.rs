@@ -70,7 +70,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 .clone()
                 .unwrap_or_else(mcpmux_runtime::default_data_dir),
         )
-        .with_log_filter(args.log_filter.clone())
         .with_registry_url(
             args.registry_url
                 .clone()

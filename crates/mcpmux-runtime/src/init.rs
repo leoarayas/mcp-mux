@@ -71,9 +71,6 @@ pub struct RuntimeConfig {
     /// Registry API URL used by `ServerDiscoveryService`. `MCPMUX_REGISTRY_URL`
     /// env var overrides the default at construction time.
     pub registry_url: String,
-    /// Tracing filter applied when [`crate::logging::init_tracing`] is
-    /// called by the host binary.
-    pub log_filter: String,
     /// Which master-key provider to use.
     pub key_provider_policy: KeyProviderPolicy,
     /// Capacity for the shared event bus broadcast channel.
@@ -99,7 +96,6 @@ impl Default for RuntimeConfig {
             log_dir: None,
             registry_url: std::env::var("MCPMUX_REGISTRY_URL")
                 .unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string()),
-            log_filter: crate::logging::default_filter(),
             key_provider_policy: KeyProviderPolicy::Auto,
             event_bus_capacity: 256,
             server_log_max_file_size: DEFAULT_SERVER_LOG_MAX_FILE_SIZE,
@@ -144,11 +140,6 @@ impl RuntimeBuilder {
 
     pub fn with_key_provider_policy(mut self, policy: KeyProviderPolicy) -> Self {
         self.config.key_provider_policy = policy;
-        self
-    }
-
-    pub fn with_log_filter(mut self, filter: impl Into<String>) -> Self {
-        self.config.log_filter = filter.into();
         self
     }
 
