@@ -54,6 +54,14 @@ function checkAppBuilt(): void {
     console.error('Run "pnpm build" first.\n');
     process.exit(1);
   }
+
+  // A binary built before MCPMUX_E2E_DATA_DIR support silently ignores it and would
+  // run every spec against the developer's real McpMux profile.
+  if (!fs.readFileSync(APP_PATH).includes('MCPMUX_E2E_DATA_DIR')) {
+    console.error(`\n[ERROR] App at ${APP_PATH} does not support MCPMUX_E2E_DATA_DIR.`);
+    console.error('Rebuild it with "pnpm build" so E2E stays out of your real profile.\n');
+    process.exit(1);
+  }
 }
 
 // Check if tauri-driver is available
@@ -190,7 +198,9 @@ async function startMockServers(): Promise<void> {
 // Stop all mock servers
 function stopMockServers(): void {
   for (const server of [mockBundleApi, stubMcpHttp, stubMcpOauth]) {
-    if (!server?.pid) {
+    // Skip servers that already exited: their PID may have been reused by an unrelated
+    // process, which taskkill /T would take down along with its children.
+    if (!server?.pid || server.exitCode !== null || server.signalCode !== null) {
       continue;
     }
 
@@ -284,7 +294,10 @@ function killMcpmuxProcesses(): void {
 function killTauriDriverProcesses(): void {
   try {
     if (process.platform === 'win32') {
-      spawnSync('taskkill', ['/F', '/IM', 'tauri-driver.exe'], { stdio: 'ignore' });
+      spawnSync('taskkill', ['/F', '/T', '/IM', 'tauri-driver.exe'], { stdio: 'ignore' });
+      // tauri-driver starts msedgedriver.exe as a child. A driver killed earlier (e.g. by
+      // closeTauriDriver) leaves it orphaned, outside the /T tree, still holding port 4445.
+      spawnSync('taskkill', ['/F', '/IM', 'msedgedriver.exe'], { stdio: 'ignore' });
     } else {
       spawnSync('pkill', ['-9', 'tauri-driver'], { stdio: 'ignore' });
     }
@@ -563,8 +576,9 @@ export const config: Options.Testrunner = {
     await new Promise((resolve) => setTimeout(resolve, 1000));
   },
 
-  // Clean up mock servers after all tests complete
+  // Clean up mock servers and the last spec's driver after all tests complete
   onComplete: function () {
     stopMockServers();
+    killTauriDriverProcesses();
   },
 };
