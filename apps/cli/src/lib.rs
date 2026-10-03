@@ -517,6 +517,7 @@ async fn run_config(client: &mut ControlClient, cli: &Cli, command: &ConfigComma
             space,
             dry_run,
         } => {
+            let file = daemon_side_path(file)?;
             let value = client
                 .call(
                     Method::ConfigImport,
@@ -530,6 +531,7 @@ async fn run_config(client: &mut ControlClient, cli: &Cli, command: &ConfigComma
             emit(&cli.output, &value, render_config_import)
         }
         ConfigCommand::Validate { file } => {
+            let file = daemon_side_path(file)?;
             let value = client
                 .call(
                     Method::ConfigValidate,
@@ -539,6 +541,13 @@ async fn run_config(client: &mut ControlClient, cli: &Cli, command: &ConfigComma
             emit(&cli.output, &value, render_config_validate)
         }
     }
+}
+
+/// The daemon opens files itself, relative to its own working directory
+/// (`/` under systemd), so send it an absolute path resolved against the
+/// operator's current directory.
+fn daemon_side_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    std::path::absolute(path).map_err(|e| anyhow::anyhow!("cannot resolve {}: {e}", path.display()))
 }
 
 async fn run_workspace(
@@ -1247,4 +1256,22 @@ fn join_keys(value: &Value, key: &str) -> String {
                 .join(",")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_side_path_resolves_relative_paths_against_the_cli_cwd() {
+        let resolved = daemon_side_path(std::path::Path::new("servers.json")).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap().join("servers.json")
+        );
+
+        let absolute = std::env::temp_dir().join("servers.json");
+        assert_eq!(daemon_side_path(&absolute).unwrap(), absolute);
+    }
 }
