@@ -1144,12 +1144,19 @@ async fn servers_configure(
     let space = resolve_space(state, p.space_id.as_deref()).await?;
     let installed = find_installed(state, space, &p.server_id).await?;
 
-    // `update_config` takes the full input map; preserve existing values when
-    // the caller did not supply them.
-    let inputs = p.inputs.unwrap_or_else(|| installed.input_values.clone());
+    // `update_config` replaces whole maps, so merge the caller's changes
+    // into the stored values first: a partial file must not erase keys
+    // (e.g. a stored API key) it does not mention.
+    let inputs = merge_settings(installed.input_values.clone(), p.inputs);
+    let env = p
+        .env
+        .map(|changes| merge_settings(installed.env_overrides.clone(), Some(changes)));
+    let headers = p
+        .headers
+        .map(|changes| merge_settings(installed.extra_headers.clone(), Some(changes)));
     let updated = state
         .server_app_service()
-        .update_config(space, &p.server_id, inputs, p.env, p.args, p.headers)
+        .update_config(space, &p.server_id, inputs, env, p.args, headers)
         .await?;
 
     Ok(serde_json::to_value(InstalledServerRef {
@@ -1159,6 +1166,25 @@ async fn servers_configure(
         enabled: updated.enabled,
     })
     .expect("InstalledServerRef is serializable"))
+}
+
+/// Apply key-level changes to a stored map: `Some(value)` sets the key,
+/// `None` removes it, unmentioned keys are kept.
+fn merge_settings(
+    mut current: HashMap<String, String>,
+    changes: Option<HashMap<String, Option<String>>>,
+) -> HashMap<String, String> {
+    for (key, value) in changes.unwrap_or_default() {
+        match value {
+            Some(value) => {
+                current.insert(key, value);
+            }
+            None => {
+                current.remove(&key);
+            }
+        }
+    }
+    current
 }
 
 async fn servers_enable(

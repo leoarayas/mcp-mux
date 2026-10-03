@@ -293,6 +293,8 @@ pub enum ServersCommand {
         #[arg(long, value_name = "SPACE")]
         space: Option<String>,
         /// JSON file with `{ "inputs": {...}, "env": {...}, "args": [...], "headers": {...} }`.
+        /// Map entries are merged into the stored values (`null` removes a
+        /// key); `args` replaces the list.
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
     },

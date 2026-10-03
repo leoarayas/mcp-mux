@@ -458,6 +458,76 @@ async fn feature_set_members_use_the_feature_sets_own_space() {
     let _ = child.wait();
 }
 
+/// `servers.configure` merges into the stored maps: keys the file does not
+/// mention survive, and `null` removes a key.
+#[tokio::test]
+async fn servers_configure_merges_instead_of_replacing() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
+
+    // A user-config server: installed without touching the registry.
+    let file = data_dir.path().join("servers.json");
+    std::fs::write(&file, r#"{"mcpServers":{"alpha":{"command":"echo"}}}"#).unwrap();
+    let imported = call(
+        &socket,
+        &request_with(
+            "i1",
+            "config.import",
+            serde_json::json!({"file": file.to_string_lossy()}),
+        ),
+    )
+    .await;
+    assert!(imported.ok, "import failed: {:?}", imported.error);
+
+    for (id, params) in [
+        (
+            "c1",
+            serde_json::json!({"server_id": "alpha",
+                "inputs": {"API_KEY": "k", "ORG_ID": "o"}, "env": {"A": "1", "B": "2"}}),
+        ),
+        (
+            "c2",
+            serde_json::json!({"server_id": "alpha",
+                "inputs": {"ORG_ID": "o2"}, "env": {"B": null, "C": "3"}}),
+        ),
+    ] {
+        let r = call(&socket, &request_with(id, "servers.configure", params)).await;
+        assert!(r.ok, "configure failed: {:?}", r.error);
+    }
+
+    let inspect = call(
+        &socket,
+        &request_with(
+            "n1",
+            "servers.inspect",
+            serde_json::json!({"server_id": "alpha"}),
+        ),
+    )
+    .await;
+    assert!(inspect.ok, "inspect failed: {:?}", inspect.error);
+    let data = inspect.data.unwrap();
+    let server = &data.as_array().unwrap()[0];
+    let keys = |field: &str| {
+        let mut keys: Vec<String> = server[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(keys("configured_inputs"), vec!["API_KEY", "ORG_ID"]);
+    assert_eq!(keys("env_overrides"), vec!["A", "C"]);
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait();
+}
+
 #[tokio::test]
 async fn config_import_round_trips_a_space() {
     let data_dir = tempfile::tempdir().unwrap();

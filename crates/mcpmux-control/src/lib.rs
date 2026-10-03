@@ -471,7 +471,9 @@ pub struct ServersAddParams {
 }
 
 /// `servers.configure` updates an installed server. Any omitted field is left
-/// unchanged.
+/// unchanged. `inputs`, `env` and `headers` are merged key by key into the
+/// stored values: a string sets a key, `null` removes it, and keys not
+/// mentioned are kept. `args` replaces the whole list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServersConfigureParams {
     /// Registry definition id (as used by `servers list`).
@@ -479,13 +481,13 @@ pub struct ServersConfigureParams {
     #[serde(default)]
     pub space_id: Option<String>,
     #[serde(default)]
-    pub inputs: Option<std::collections::HashMap<String, String>>,
+    pub inputs: Option<std::collections::HashMap<String, Option<String>>>,
     #[serde(default)]
-    pub env: Option<std::collections::HashMap<String, String>>,
+    pub env: Option<std::collections::HashMap<String, Option<String>>>,
     #[serde(default)]
     pub args: Option<Vec<String>>,
     #[serde(default)]
-    pub headers: Option<std::collections::HashMap<String, String>>,
+    pub headers: Option<std::collections::HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
