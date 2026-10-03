@@ -23,6 +23,11 @@ fn free_port() -> u16 {
 /// Spawn `mcpmuxd` against a disposable data dir + runtime dir and wait until
 /// the control socket accepts a connection.
 async fn spawn_daemon(data_dir: &Path, runtime_dir: &Path) -> (Child, u16) {
+    spawn_daemon_with(data_dir, runtime_dir, &[]).await
+}
+
+/// [`spawn_daemon`] with extra command-line flags.
+async fn spawn_daemon_with(data_dir: &Path, runtime_dir: &Path, extra: &[&str]) -> (Child, u16) {
     let port = free_port();
     let port_arg = port.to_string();
     let child = Command::new(env!("CARGO_BIN_EXE_mcpmuxd"))
@@ -34,6 +39,7 @@ async fn spawn_daemon(data_dir: &Path, runtime_dir: &Path) -> (Child, u16) {
             "--port",
             &port_arg,
         ])
+        .args(extra)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .spawn()
         .unwrap();
@@ -213,6 +219,29 @@ async fn control_socket_answers_ping_and_status() {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }
     let _ = child.wait();
+}
+
+/// `--auth-disabled` must only affect the run it was passed to: a later
+/// start without the flag enforces auth again.
+#[tokio::test]
+async fn auth_disabled_flag_is_not_persisted_across_restarts() {
+    async fn auth_disabled_reported(data_dir: &Path, runtime_dir: &Path, extra: &[&str]) -> bool {
+        let (mut child, _port) = spawn_daemon_with(data_dir, runtime_dir, extra).await;
+        let status = call(&socket_path(runtime_dir), &request("s1", "status")).await;
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = child.wait();
+        assert!(status.ok, "status failed: {:?}", status.error);
+        status.data.unwrap()["auth_disabled"].as_bool().unwrap()
+    }
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    assert!(
+        auth_disabled_reported(data_dir.path(), runtime_dir.path(), &["--auth-disabled"]).await
+    );
+    assert!(!auth_disabled_reported(data_dir.path(), runtime_dir.path(), &[]).await);
 }
 
 #[tokio::test]

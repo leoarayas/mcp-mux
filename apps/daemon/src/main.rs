@@ -34,9 +34,6 @@ use args::Args;
 #[cfg(unix)]
 use args::{Command, KeyProviderArg, ServiceCommand};
 
-#[cfg(unix)]
-const GATEWAY_AUTH_DISABLED_KEY: &str = "gateway.auth_disabled";
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -126,18 +123,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let shutdown_task = tokio::spawn(wait_for_shutdown());
     tokio::task::yield_now().await;
 
-    let persisted_auth_disabled = runtime
-        .repositories
-        .app_settings
-        .get(GATEWAY_AUTH_DISABLED_KEY)
-        .await
-        .map(|value| value.as_deref() == Some("true"))
-        .unwrap_or_else(|e| {
-            warn!(error = %e, "[mcpmuxd] failed to load auth-disabled setting");
-            false
-        });
-    let auth_disabled = args.auth_disabled || persisted_auth_disabled;
-    if auth_disabled {
+    // `--auth-disabled` applies to this run only. It is never persisted:
+    // a one-off local test must not leave a later service start (possibly
+    // behind --public-base-url) unauthenticated.
+    if args.auth_disabled {
+        warn!("[mcpmuxd] inbound MCP auth is DISABLED for this run (--auth-disabled)");
         gateway_state.write().await.set_auth_disabled(true);
     }
 
@@ -159,21 +149,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "gateway failed to bind {bind_host}:{preferred_port}: {e} \
              (is the McpMux desktop app or another mcpmuxd already using this port?)"
         ));
-    }
-
-    // Persist the auth-disabled flag when --auth-disabled was passed.
-    // Phase 2 will move this to a dedicated `mcpmux config` invocation;
-    // for now we mirror the desktop's runtime settings write so a
-    // restart keeps the choice.
-    if args.auth_disabled {
-        if let Err(e) = runtime
-            .repositories
-            .app_settings
-            .set(GATEWAY_AUTH_DISABLED_KEY, "true")
-            .await
-        {
-            warn!(error = %e, "[mcpmuxd] failed to persist auth-disabled flag");
-        }
     }
 
     // Post-spawn /health probe. systemd-journal readers see "ready" as
@@ -217,6 +192,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         mcpmux_core::EventSender::from_broadcast(gateway_state.read().await.domain_event_sender());
     let control_state = std::sync::Arc::new(control::ControlState {
         runtime: runtime.clone(),
+        gateway_state: gateway_state.clone(),
         gateway_events,
         pool_service: control_pool_service,
         feature_service: control_feature_service,

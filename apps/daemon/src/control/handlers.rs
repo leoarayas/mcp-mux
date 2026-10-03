@@ -30,8 +30,8 @@ use mcpmux_core::{
 };
 use mcpmux_gateway::pool::transport::resolution::build_transport_config;
 use mcpmux_gateway::{
-    ConnectionContext, ConnectionResult, ConnectionStatus, FeatureService, PoolService, ServerKey,
-    ServerManager,
+    ConnectionContext, ConnectionResult, ConnectionStatus, FeatureService, GatewayState,
+    PoolService, ServerKey, ServerManager,
 };
 use mcpmux_runtime::Runtime;
 use mcpmux_storage::{InboundClient, InboundClientRepository, RegistrationType};
@@ -86,6 +86,8 @@ impl From<anyhow::Error> for ApiError {
 /// Everything a handler needs from the running daemon.
 pub struct ControlState {
     pub runtime: Arc<Runtime>,
+    /// The live gateway's state (auth mode, sessions).
+    pub gateway_state: Arc<tokio::sync::RwLock<GatewayState>>,
     /// Sender for the gateway's domain-event channel. Every mutation emits
     /// here so connected MCP sessions see `list_changed`; the event bridge
     /// then forwards each event once to `events.subscribe` listeners.
@@ -255,16 +257,8 @@ async fn status(state: &ControlState) -> Result<serde_json::Value, ApiError> {
     let installed = state.runtime.repositories.installed_server.list().await?;
     let enabled = installed.iter().filter(|s| s.enabled).count();
     let connected = state.server_manager.connected_count().await;
-    let auth_disabled = state
-        .runtime
-        .repositories
-        .app_settings
-        .get(GATEWAY_AUTH_DISABLED_KEY)
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
+    // Report what the running gateway enforces, not a settings row.
+    let auth_disabled = state.gateway_state.read().await.auth_disabled();
 
     let status = DaemonStatus {
         pid: state.pid,
@@ -286,8 +280,6 @@ async fn health(state: &ControlState) -> Result<serde_json::Value, ApiError> {
         "pid": state.pid,
     }))
 }
-
-const GATEWAY_AUTH_DISABLED_KEY: &str = "gateway.auth_disabled";
 
 // =============================================================================
 // Doctor

@@ -63,8 +63,8 @@ pub struct Args {
     #[arg(long, value_name = "URL", global = true)]
     pub public_base_url: Option<String>,
 
-    /// Disable inbound MCP auth (loopback convenience). Persisted in
-    /// `gateway.auth_disabled` so a subsequent restart keeps the setting.
+    /// Disable inbound MCP auth for this run only (loopback convenience).
+    /// Not persisted: every start without the flag enforces auth.
     #[arg(long, global = true)]
     pub auth_disabled: bool,
 }
