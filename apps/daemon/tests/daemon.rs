@@ -279,6 +279,106 @@ async fn auth_disabled_flag_is_not_persisted_across_restarts() {
     assert!(!auth_disabled_reported(data_dir.path(), runtime_dir.path(), &[]).await);
 }
 
+/// A dry run must report what the real import would add, update and remove;
+/// an import the sync rejects must not replace the Space file.
+#[tokio::test]
+async fn config_import_dry_run_matches_real_import_and_rejects_cleanly() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
+
+    let import = |id: &str, body: &str| {
+        let path = data_dir.path().join(format!("{id}.json"));
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().to_string()
+    };
+    let installed_ids = || async {
+        let list = call(
+            &socket,
+            &request_with("l", "servers.list", serde_json::json!({})),
+        )
+        .await;
+        let mut ids: Vec<String> = list
+            .data
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["server_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let first = import(
+        "first",
+        r#"{"mcpServers":{"alpha":{"command":"echo"},"beta":{"command":"echo"}}}"#,
+    );
+    let response = call(
+        &socket,
+        &request_with("i1", "config.import", serde_json::json!({"file": first})),
+    )
+    .await;
+    assert!(response.ok, "import failed: {:?}", response.error);
+    assert_eq!(installed_ids().await, vec!["alpha", "beta"]);
+
+    // Dry run of a document holding only beta and gamma.
+    let second = import(
+        "second",
+        r#"{"mcpServers":{"beta":{"command":"echo"},"gamma":{"command":"echo"}}}"#,
+    );
+    let dry = call(
+        &socket,
+        &request_with(
+            "i2",
+            "config.import",
+            serde_json::json!({"file": second, "dry_run": true}),
+        ),
+    )
+    .await;
+    assert!(dry.ok, "dry run failed: {:?}", dry.error);
+    let plan = dry.data.unwrap();
+    assert_eq!(plan["added"], serde_json::json!(["gamma"]));
+    assert_eq!(plan["updated"], serde_json::json!(["beta"]));
+    assert_eq!(plan["removed"], serde_json::json!(["alpha"]));
+    assert_eq!(
+        installed_ids().await,
+        vec!["alpha", "beta"],
+        "dry run changed state"
+    );
+
+    // Two keys normalizing to one id: rejected, nothing replaced.
+    let spaces_dir = data_dir.path().join("spaces");
+    let space_file = std::fs::read_dir(&spaces_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .expect("space file written by the first import");
+    let before = std::fs::read_to_string(&space_file).unwrap();
+    let colliding = import(
+        "colliding",
+        r#"{"mcpServers":{"My Server":{"command":"echo"},"my_server":{"command":"echo"}}}"#,
+    );
+    let rejected = call(
+        &socket,
+        &request_with(
+            "i3",
+            "config.import",
+            serde_json::json!({"file": colliding}),
+        ),
+    )
+    .await;
+    assert!(!rejected.ok, "colliding ids must be rejected");
+    assert_eq!(std::fs::read_to_string(&space_file).unwrap(), before);
+    assert_eq!(installed_ids().await, vec!["alpha", "beta"]);
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait();
+}
+
 #[tokio::test]
 async fn config_import_round_trips_a_space() {
     let data_dir = tempfile::tempdir().unwrap();

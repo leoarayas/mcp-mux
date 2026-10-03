@@ -1772,16 +1772,28 @@ async fn config_import(
         ));
     }
 
-    // Dry-run reports the parsed server set without persisting.
+    let space_config =
+        mcpmux_core::get_space_config_path(&state.runtime.spaces_dir, &space.to_string())
+            .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let sync = mcpmux_core::application::UserSpaceSyncService::new(
+        state.runtime.repositories.installed_server.clone(),
+    );
+
+    // Diff the document against what is installed from the Space file today
+    // without writing anything. This is the dry-run answer, and it also
+    // rejects a document the sync would refuse (e.g. two keys normalizing to
+    // one server id) before the Space file is touched.
+    let plan = sync
+        .plan_from_content(&space.to_string(), &space_config, &raw)
+        .await
+        .map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     if p.dry_run {
-        let mut ids: Vec<String> = servers.keys().cloned().collect();
-        ids.sort();
         return Ok(serde_json::to_value(ConfigImportResponse {
             space_id: space.to_string(),
             dry_run: true,
-            added: ids,
-            updated: Vec::new(),
-            removed: Vec::new(),
+            added: plan.added,
+            updated: plan.updated,
+            removed: plan.removed,
             backup: None,
         })
         .expect("ConfigImportResponse is serializable"));
@@ -1789,27 +1801,33 @@ async fn config_import(
 
     // Back up the Space's live config file (if any), then replace it with the
     // imported document and sync through the same path the desktop uses.
-    let space_config =
-        mcpmux_core::get_space_config_path(&state.runtime.spaces_dir, &space.to_string())
-            .map_err(|e| ApiError::invalid(e.to_string()))?;
     let backup = if space_config.is_file() {
         let bak = space_config.with_extension("json.mcpmux-bak");
         std::fs::copy(&space_config, &bak)
             .map_err(|e| ApiError::internal(format!("backup failed: {e}")))?;
-        Some(bak.to_string_lossy().to_string())
+        Some(bak)
     } else {
         None
     };
     std::fs::write(&space_config, &raw)
         .map_err(|e| ApiError::internal(format!("cannot write {}: {e}", space_config.display())))?;
 
-    let sync = mcpmux_core::application::UserSpaceSyncService::new(
-        state.runtime.repositories.installed_server.clone(),
-    );
-    let result = sync
-        .sync_from_file(&space.to_string(), &space_config)
-        .await
-        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let result = match sync.sync_from_file(&space.to_string(), &space_config).await {
+        Ok(result) => result,
+        Err(e) => {
+            // Put the previous Space file back so it keeps matching the
+            // installed servers.
+            let restored = match &backup {
+                Some(bak) => std::fs::copy(bak, &space_config).map(|_| ()),
+                None => std::fs::remove_file(&space_config),
+            };
+            if let Err(restore_err) = restored {
+                warn!(error = %restore_err, path = %space_config.display(),
+                    "[control] failed to restore the Space file after a failed import");
+            }
+            return Err(ApiError::invalid(format!("{e:#}")));
+        }
+    };
 
     Ok(serde_json::to_value(ConfigImportResponse {
         space_id: space.to_string(),
@@ -1817,7 +1835,7 @@ async fn config_import(
         added: result.added,
         updated: result.updated,
         removed: result.removed,
-        backup,
+        backup: backup.map(|bak| bak.to_string_lossy().to_string()),
     })
     .expect("ConfigImportResponse is serializable"))
 }
