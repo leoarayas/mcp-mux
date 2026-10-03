@@ -462,6 +462,22 @@ async fn control_socket_streams_events_after_subscribe_ack() {
     .expect("did not receive SpaceCreated event on the stream");
     assert_eq!(event.version, PROTOCOL_VERSION);
 
+    // Mutations emit on the gateway's channel and reach the stream through
+    // the event bridge; that must not deliver the same event twice.
+    let duplicate = timeout(Duration::from_millis(500), async {
+        loop {
+            let envelope: EventEnvelope = read_frame(&mut reader).await.unwrap();
+            if matches!(
+                envelope.event,
+                mcpmux_core::DomainEvent::SpaceCreated { .. }
+            ) {
+                return envelope;
+            }
+        }
+    })
+    .await;
+    assert!(duplicate.is_err(), "SpaceCreated was delivered twice");
+
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
     }

@@ -24,7 +24,7 @@ use mcpmux_control::{
     WorkspaceConfigResponse, WorkspacesBindParams, WorkspacesListParams, WorkspacesUnbindParams,
 };
 use mcpmux_core::{
-    ConfigExporter, ConfigFormat, DomainEvent, FeatureType, LogLevel, MemberMode,
+    ConfigExporter, ConfigFormat, DomainEvent, EventSender, FeatureType, LogLevel, MemberMode,
     PermissionAppService, ResolvedServer, ResolvedTransport, ServerAppService, ServerDefinition,
     TransportConfig, WorkspaceBinding,
 };
@@ -86,6 +86,10 @@ impl From<anyhow::Error> for ApiError {
 /// Everything a handler needs from the running daemon.
 pub struct ControlState {
     pub runtime: Arc<Runtime>,
+    /// Sender for the gateway's domain-event channel. Every mutation emits
+    /// here so connected MCP sessions see `list_changed`; the event bridge
+    /// then forwards each event once to `events.subscribe` listeners.
+    pub gateway_events: EventSender,
     pub pool_service: Arc<PoolService>,
     pub feature_service: Arc<FeatureService>,
     pub server_manager: Arc<ServerManager>,
@@ -102,14 +106,14 @@ impl ControlState {
             self.runtime.repositories.installed_server.clone(),
             Some(self.runtime.repositories.server_feature_core.clone()),
             Some(self.runtime.repositories.credential.clone()),
-            self.runtime.event_bus.sender(),
+            self.gateway_events.clone(),
         )
     }
 
     fn permission_app_service(&self) -> PermissionAppService {
         PermissionAppService::new(
             self.runtime.repositories.feature_set.clone(),
-            self.runtime.event_bus.sender(),
+            self.gateway_events.clone(),
         )
     }
 
@@ -121,8 +125,10 @@ impl ControlState {
         InboundClientRepository::new(self.runtime.database.clone())
     }
 
+    /// Emit on the gateway's channel (not the runtime bus) so MCPNotifier
+    /// reacts; see [`Self::gateway_events`].
     fn emit(&self, event: DomainEvent) {
-        self.runtime.event_bus.sender().emit(event);
+        self.gateway_events.emit(event);
     }
 }
 
@@ -750,16 +756,12 @@ async fn feature_sets_add_member(
         )));
     }
 
-    state
-        .runtime
-        .event_bus
-        .sender()
-        .emit(DomainEvent::FeatureSetMembersChanged {
-            space_id: space,
-            feature_set_id: feature_set.id.clone(),
-            added_count: added,
-            removed_count: 0,
-        });
+    state.emit(DomainEvent::FeatureSetMembersChanged {
+        space_id: space,
+        feature_set_id: feature_set.id.clone(),
+        added_count: added,
+        removed_count: 0,
+    });
 
     Ok(json!({
         "feature_set_id": feature_set.id,
@@ -813,16 +815,12 @@ async fn feature_sets_remove_member(
         .await?;
 
     if let Ok(space) = resolve_space(state, p.space_id.as_deref()).await {
-        state
-            .runtime
-            .event_bus
-            .sender()
-            .emit(DomainEvent::FeatureSetMembersChanged {
-                space_id: space,
-                feature_set_id: feature_set.id.clone(),
-                added_count: 0,
-                removed_count: 1,
-            });
+        state.emit(DomainEvent::FeatureSetMembersChanged {
+            space_id: space,
+            feature_set_id: feature_set.id.clone(),
+            added_count: 0,
+            removed_count: 1,
+        });
     }
 
     Ok(json!({

@@ -213,8 +213,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // Start the local control socket now that the gateway is confirmed up.
     // The CLI refuses to run without it, so a bind failure (e.g. another
     // daemon on the same data dir) is fatal rather than silent.
+    let gateway_events =
+        mcpmux_core::EventSender::from_broadcast(gateway_state.read().await.domain_event_sender());
     let control_state = std::sync::Arc::new(control::ControlState {
         runtime: runtime.clone(),
+        gateway_events,
         pool_service: control_pool_service,
         feature_service: control_feature_service,
         server_manager: control_server_manager,
