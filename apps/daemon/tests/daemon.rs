@@ -379,6 +379,85 @@ async fn config_import_dry_run_matches_real_import_and_rejects_cleanly() {
     let _ = child.wait();
 }
 
+/// Member changes act on the FeatureSet's own Space, not the default one.
+#[tokio::test]
+async fn feature_set_members_use_the_feature_sets_own_space() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let (mut child, _port) = spawn_daemon(data_dir.path(), runtime_dir.path()).await;
+    let socket = socket_path(runtime_dir.path(), data_dir.path());
+
+    let default_space = call(&socket, &request("d", "spaces.list"))
+        .await
+        .data
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["is_default"] == true)
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .expect("default space");
+    let other = call(
+        &socket,
+        &request_with("c1", "spaces.create", serde_json::json!({"name": "Other"})),
+    )
+    .await;
+    assert!(other.ok, "spaces.create failed: {:?}", other.error);
+    let other_space = other.data.unwrap()["id"].as_str().unwrap().to_string();
+    let fs = call(
+        &socket,
+        &request_with(
+            "c2",
+            "feature-sets.create",
+            serde_json::json!({"space_id": other_space, "name": "Other FS"}),
+        ),
+    )
+    .await;
+    assert!(fs.ok, "feature-sets.create failed: {:?}", fs.error);
+    let fs_id = fs.data.unwrap()["id"].as_str().unwrap().to_string();
+
+    // No --space: resolved to the feature set's Space, not the default.
+    let added = call(
+        &socket,
+        &request_with(
+            "a1",
+            "feature-sets.add-member",
+            serde_json::json!({"feature_set_id": fs_id, "server_id": "absent"}),
+        ),
+    )
+    .await;
+    assert!(!added.ok);
+    let message = added.error.unwrap().message;
+    assert!(message.contains(&other_space), "{message}");
+    assert!(!message.contains(&default_space), "{message}");
+
+    // A conflicting --space is rejected.
+    let conflicting = call(
+        &socket,
+        &request_with(
+            "a2",
+            "feature-sets.add-member",
+            serde_json::json!({
+                "feature_set_id": fs_id,
+                "server_id": "absent",
+                "space_id": default_space,
+            }),
+        ),
+    )
+    .await;
+    assert!(!conflicting.ok);
+    assert!(conflicting
+        .error
+        .unwrap()
+        .message
+        .contains("belongs to space"));
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait();
+}
+
 #[tokio::test]
 async fn config_import_round_trips_a_space() {
     let data_dir = tempfile::tempdir().unwrap();

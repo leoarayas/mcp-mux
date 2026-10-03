@@ -166,6 +166,36 @@ async fn resolve_space(state: &ControlState, space_id: Option<&str>) -> Result<U
     }
 }
 
+/// The Space a FeatureSet's members live in: its own `space_id`. An explicit
+/// `--space` must agree with it; only a FeatureSet without a Space falls back
+/// to `--space` / the default Space.
+async fn feature_set_space(
+    state: &ControlState,
+    feature_set: &mcpmux_core::FeatureSet,
+    requested: Option<&str>,
+) -> Result<Uuid, ApiError> {
+    let Some(own) = feature_set.space_id.as_deref() else {
+        return resolve_space(state, requested).await;
+    };
+    let own = Uuid::parse_str(own).map_err(|e| {
+        ApiError::internal(format!(
+            "feature set {} has a bad space id: {e}",
+            feature_set.id
+        ))
+    })?;
+    if let Some(raw) = requested {
+        let requested =
+            Uuid::parse_str(raw).map_err(|e| ApiError::invalid(format!("space_id: {e}")))?;
+        if requested != own {
+            return Err(ApiError::invalid(format!(
+                "feature set {} belongs to space {own}, not {requested}",
+                feature_set.id
+            )));
+        }
+    }
+    Ok(own)
+}
+
 async fn find_installed(
     state: &ControlState,
     space: Uuid,
@@ -685,7 +715,6 @@ async fn feature_sets_add_member(
     state: &ControlState,
     p: FeatureSetsAddMemberParams,
 ) -> Result<serde_json::Value, ApiError> {
-    let space = resolve_space(state, p.space_id.as_deref()).await?;
     let feature_set = state
         .runtime
         .repositories
@@ -695,6 +724,7 @@ async fn feature_sets_add_member(
         .ok_or_else(|| {
             ApiError::not_found(format!("feature set {} not found", p.feature_set_id))
         })?;
+    let space = feature_set_space(state, &feature_set, p.space_id.as_deref()).await?;
 
     let feature_type = match p.feature_type.as_deref() {
         Some(raw) => Some(
@@ -777,9 +807,9 @@ async fn feature_sets_remove_member(
         .ok_or_else(|| {
             ApiError::not_found(format!("feature set {} not found", p.feature_set_id))
         })?;
+    let space = feature_set_space(state, &feature_set, p.space_id.as_deref()).await?;
 
     let feature_id = if p.by_name {
-        let space = resolve_space(state, p.space_id.as_deref()).await?;
         let server_id = p
             .server_id
             .as_deref()
@@ -806,14 +836,12 @@ async fn feature_sets_remove_member(
         .remove_feature_member(&feature_set.id, &feature_id)
         .await?;
 
-    if let Ok(space) = resolve_space(state, p.space_id.as_deref()).await {
-        state.emit(DomainEvent::FeatureSetMembersChanged {
-            space_id: space,
-            feature_set_id: feature_set.id.clone(),
-            added_count: 0,
-            removed_count: 1,
-        });
-    }
+    state.emit(DomainEvent::FeatureSetMembersChanged {
+        space_id: space,
+        feature_set_id: feature_set.id.clone(),
+        added_count: 0,
+        removed_count: 1,
+    });
 
     Ok(json!({
         "feature_set_id": feature_set.id,
