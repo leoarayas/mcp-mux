@@ -227,6 +227,9 @@ mod tests {
         restore_environment_variable("XDG_RUNTIME_DIR", previous);
     }
 
+    // Unix only, like the control socket itself: the pinned hash is of the
+    // `/`-separated path, and Windows re-joins normalized components with `\`.
+    #[cfg(unix)]
     #[test]
     fn control_socket_is_per_data_dir_and_stable() {
         let rt = Some(PathBuf::from("/run/user/1000"));
