@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use mcpmux_core::DomainEvent;
 use mcpmux_gateway::GatewayConfig;
-use mcpmux_runtime::{spawn_event_bridge, RuntimeBuilder};
+use mcpmux_runtime::spawn_event_bridge;
 
 use super::{next_test_port, Fixture};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_state_events_flow_through_runtime_event_bus() {
     let fx = Fixture::new();
-    let runtime = RuntimeBuilder::new()
+    let runtime = super::runtime_builder()
         .with_data_dir(fx.data_dir())
         .build()
         .await

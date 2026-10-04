@@ -6,21 +6,19 @@
 //! runtime needs to provide so the desktop and daemon never silently
 //! share a data directory.
 
-use mcpmux_runtime::RuntimeBuilder;
-
 use super::Fixture;
 
 #[tokio::test]
 async fn second_build_against_held_data_dir_fails_with_owner_info() {
     let fx = Fixture::new();
 
-    let runtime = RuntimeBuilder::new()
+    let runtime = super::runtime_builder()
         .with_data_dir(fx.data_dir())
         .build()
         .await
         .expect("first runtime");
 
-    let err = match RuntimeBuilder::new()
+    let err = match super::runtime_builder()
         .with_data_dir(fx.data_dir())
         .build()
         .await

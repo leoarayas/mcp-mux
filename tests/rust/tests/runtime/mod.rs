@@ -51,3 +51,19 @@ impl Fixture {
         self.dir.path().to_path_buf()
     }
 }
+
+/// A [`mcpmux_runtime::RuntimeBuilder`] that never touches the developer's
+/// OS credential store. With the default `Auto` policy, Linux and macOS go
+/// to the real keychain: on a desktop with a locked login keyring that
+/// opens an unlock prompt and blocks the test indefinitely, and on success
+/// it writes test secrets into the user's keychain. The file provider keeps
+/// key material inside the test's `TempDir`. Windows keeps `Auto` (DPAPI,
+/// no prompt), since the file provider is not supported there.
+pub fn runtime_builder() -> mcpmux_runtime::RuntimeBuilder {
+    let builder = mcpmux_runtime::RuntimeBuilder::new();
+    if cfg!(windows) {
+        builder
+    } else {
+        builder.with_key_provider_policy(mcpmux_runtime::KeyProviderPolicy::File)
+    }
+}

@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use mcpmux_gateway::GatewayConfig;
-use mcpmux_runtime::{wait_for_health, HealthCheckConfig, HealthStatus, RuntimeBuilder};
+use mcpmux_runtime::{wait_for_health, HealthCheckConfig, HealthStatus};
 use tokio::time::sleep;
 
 use super::{next_test_port, Fixture};
@@ -19,7 +19,7 @@ use super::{next_test_port, Fixture};
 async fn runtime_initialises_against_empty_data_dir() {
     let fx = Fixture::new();
 
-    let runtime = RuntimeBuilder::new()
+    let runtime = super::runtime_builder()
         .with_data_dir(fx.data_dir())
         .build()
         .await
@@ -76,7 +76,7 @@ async fn runtime_boots_gateway_and_serves_health() {
     let fx = Fixture::new();
     let port = next_test_port();
 
-    let runtime = RuntimeBuilder::new()
+    let runtime = super::runtime_builder()
         .with_data_dir(fx.data_dir())
         .build()
         .await
@@ -123,7 +123,7 @@ async fn runtime_drop_releases_lock_for_next_process() {
     let fx = Fixture::new();
 
     {
-        let _runtime = RuntimeBuilder::new()
+        let _runtime = super::runtime_builder()
             .with_data_dir(fx.data_dir())
             .build()
             .await
@@ -131,7 +131,7 @@ async fn runtime_drop_releases_lock_for_next_process() {
 
         // Second acquire against the same data dir must fail with a
         // known owner (us).
-        let err = match mcpmux_runtime::RuntimeBuilder::new()
+        let err = match super::runtime_builder()
             .with_data_dir(fx.data_dir())
             .build()
             .await
@@ -149,7 +149,7 @@ async fn runtime_drop_releases_lock_for_next_process() {
     }
 
     // Once the first runtime is gone, a fresh build must succeed.
-    let _runtime2 = RuntimeBuilder::new()
+    let _runtime2 = super::runtime_builder()
         .with_data_dir(fx.data_dir())
         .build()
         .await
