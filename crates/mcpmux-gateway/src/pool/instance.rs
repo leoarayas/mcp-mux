@@ -4,7 +4,7 @@
 //! No sharing between spaces - this is a security boundary.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
@@ -22,6 +22,14 @@ pub use mcpmux_core::TransportType;
 
 /// Type alias for the MCP client service
 pub type McpClient = RunningService<RoleClient, McpClientHandler>;
+
+/// Upper bound on [`McpClientConnection::shutdown`].
+///
+/// rmcp's own cleanup waits several seconds for a child to exit after stdin
+/// closes, and can block indefinitely behind a write to a server that stopped
+/// reading. Shutdown runs on the app-exit path, which has ~2.5s in total
+/// before Windows reports the app as not responding.
+const CLIENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Client handler for MCP connections
 #[derive(Clone)]
@@ -374,14 +382,24 @@ impl McpClientConnection {
         }
     }
 
-    /// Cancel the MCP service and wait for its transport to release its child process.
+    /// Cancel the MCP service and wait, bounded by [`CLIENT_SHUTDOWN_TIMEOUT`],
+    /// for its transport to release its child process.
+    ///
+    /// On timeout the service is dropped: its task finishes cleanup in the
+    /// background, and on Windows the kill-on-close job still takes the whole
+    /// process tree down when the transport (or McpMux itself) goes away.
     pub async fn shutdown(self) {
-        let client = match self {
+        let mut client = match self {
             Self::Stdio { client } | Self::Http { client } => client,
         };
 
-        if let Err(error) = client.cancel().await {
-            warn!(%error, "Failed to shut down MCP client service");
+        match client.close_with_timeout(CLIENT_SHUTDOWN_TIMEOUT).await {
+            Ok(Some(_)) => {}
+            Ok(None) => warn!(
+                "MCP client service did not shut down within {:?}; dropping it",
+                CLIENT_SHUTDOWN_TIMEOUT
+            ),
+            Err(error) => warn!(%error, "Failed to shut down MCP client service"),
         }
     }
 }
