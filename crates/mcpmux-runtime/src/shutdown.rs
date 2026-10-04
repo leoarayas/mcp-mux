@@ -6,14 +6,16 @@
 //! that resolves with a label identifying which signal triggered the
 //! shutdown.
 //!
-//! The graceful-shutdown helper [`shutdown_gateway_handle`] mirrors
-//! `apps/desktop/src-tauri/src/commands/gateway::shutdown_gateway_handle`:
-//! send the shutdown signal, await the join handle with a 2-second
-//! timeout, abort as a last resort if axum hasn't drained in time.
+//! The graceful-shutdown helper [`shutdown_gateway_handle`] sends the
+//! shutdown signal, awaits the join handle with a 2-second timeout, and
+//! aborts as a last resort if axum hasn't drained in time.
+//! [`shutdown_gateway_runtime`] pairs it with a bounded backend-pool drain;
+//! both the desktop and the daemon tear their gateway down through it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use mcpmux_gateway::GatewayServerHandle;
+use mcpmux_gateway::{GatewayServerHandle, PoolService};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -94,4 +96,41 @@ pub async fn shutdown_gateway_handle(mut handle: GatewayServerHandle) {
             abort.abort();
         }
     }
+}
+
+/// Upper bound on draining the backend pool when the gateway goes down.
+///
+/// Each client close is itself bounded (1.5s); this caps the extra time spent
+/// waiting on connects that were already in flight.
+pub const POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Tear down a gateway: close its listener and drain its backend pool,
+/// concurrently and both bounded.
+///
+/// Running them side by side keeps the desktop's app-exit path inside its
+/// ~2.5s budget, and closes the listener while backends are going away
+/// instead of serving requests that can only fail.
+pub async fn shutdown_gateway_runtime(
+    handle: Option<GatewayServerHandle>,
+    pool_service: Option<Arc<PoolService>>,
+) {
+    let drain_pool = async {
+        if let Some(pool) = pool_service {
+            if timeout(POOL_SHUTDOWN_TIMEOUT, pool.shutdown())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "[runtime] backend pool did not drain within {:?}; continuing shutdown",
+                    POOL_SHUTDOWN_TIMEOUT
+                );
+            }
+        }
+    };
+    let close_listener = async {
+        if let Some(h) = handle {
+            shutdown_gateway_handle(h).await;
+        }
+    };
+    tokio::join!(drain_pool, close_listener);
 }

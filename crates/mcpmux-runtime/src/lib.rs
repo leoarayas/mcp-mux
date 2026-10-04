@@ -31,4 +31,6 @@ pub use paths::{
     control_dir, control_dir_under, control_socket_path, default_data_dir, resolve_data_dir,
     DATA_DIR_NAME,
 };
-pub use shutdown::{shutdown_gateway_handle, wait_for_shutdown};
+pub use shutdown::{
+    shutdown_gateway_handle, shutdown_gateway_runtime, wait_for_shutdown, POOL_SHUTDOWN_TIMEOUT,
+};

@@ -976,8 +976,7 @@ pub fn run() {
                             (state.handle.take(), state.pool_service.take())
                         };
                         info!("[Gateway] ExitRequested — gracefully shutting down gateway");
-                        crate::commands::gateway::shutdown_gateway_runtime(handle, pool_service)
-                            .await;
+                        mcpmux_runtime::shutdown_gateway_runtime(handle, pool_service).await;
                     });
                 }
             }

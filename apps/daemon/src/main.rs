@@ -12,7 +12,7 @@ use clap::Parser;
 use mcpmux_gateway::GatewayConfig;
 #[cfg(unix)]
 use mcpmux_runtime::{
-    init_tracing, shutdown_gateway_handle, wait_for_health, wait_for_shutdown, HealthCheckConfig,
+    init_tracing, shutdown_gateway_runtime, wait_for_health, wait_for_shutdown, HealthCheckConfig,
     HealthStatus, KeyProviderPolicy, LogSink, RuntimeBuilder, TracingConfig,
 };
 #[cfg(unix)]
@@ -141,8 +141,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // another process (e.g. the desktop app) already owning this port.
     if let Err(e) = handle.wait_until_bound().await {
         error!(error = %e, "[mcpmuxd] gateway failed to bind");
-        shutdown_pool_service.shutdown().await;
-        shutdown_gateway_handle(handle).await;
+        shutdown_gateway_runtime(Some(handle), Some(shutdown_pool_service)).await;
         shutdown_task.abort();
         return Err(anyhow::anyhow!(
             "gateway failed to bind {bind_host}:{preferred_port}: {e} \
@@ -174,8 +173,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 attempts,
                 last_error, "[mcpmuxd] /health did not return 200 within the probe window"
             );
-            shutdown_pool_service.shutdown().await;
-            shutdown_gateway_handle(handle).await;
+            shutdown_gateway_runtime(Some(handle), Some(shutdown_pool_service)).await;
             shutdown_task.abort();
             return Err(anyhow::anyhow!("health probe failed"));
         }
@@ -205,8 +203,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Ok(server) => server,
         Err(e) => {
             error!(error = %e, "[mcpmuxd] control socket failed to start");
-            shutdown_pool_service.shutdown().await;
-            shutdown_gateway_handle(handle).await;
+            shutdown_gateway_runtime(Some(handle), Some(shutdown_pool_service)).await;
             shutdown_task.abort();
             return Err(anyhow::anyhow!(e.to_string()));
         }
@@ -223,8 +220,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
 
     drop(control_server);
-    shutdown_pool_service.shutdown().await;
-    shutdown_gateway_handle(handle).await;
+    shutdown_gateway_runtime(Some(handle), Some(shutdown_pool_service)).await;
 
     info!("[mcpmuxd] stopped cleanly");
     Ok(())

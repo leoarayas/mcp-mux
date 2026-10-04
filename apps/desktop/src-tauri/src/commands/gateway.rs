@@ -84,76 +84,6 @@ pub struct GatewayAppState {
     pub session_roots: Option<Arc<mcpmux_gateway::services::SessionRootsRegistry>>,
 }
 
-/// Gracefully shuts down a running gateway and waits for the axum task
-/// to finish so the TCP listener is released back to the OS.
-///
-/// Without this, `handle.abort()` alone can leave an orphaned
-/// kernel-level bind — a listener socket that netstat still reports even
-/// though no process exists — preventing the next `start_gateway` from
-/// binding the same port.
-///
-/// Flow:
-/// 1. Send the graceful-shutdown signal (axum drains in-flight requests).
-/// 2. Await the task up to 2s so Rust Drop closes the listener fd.
-/// 3. If the task hasn't returned by then, abort as a last resort.
-pub(crate) async fn shutdown_gateway_handle(mut handle: mcpmux_gateway::GatewayServerHandle) {
-    let abort = handle.task.abort_handle();
-    handle.shutdown();
-    match tokio::time::timeout(std::time::Duration::from_secs(2), handle.task).await {
-        Ok(Ok(Ok(()))) => info!("[Gateway] Gateway task exited cleanly"),
-        Ok(Ok(Err(e))) => warn!(
-            "[Gateway] Gateway task returned error during shutdown: {}",
-            e
-        ),
-        Ok(Err(e)) if e.is_cancelled() => info!("[Gateway] Gateway task was already cancelled"),
-        Ok(Err(e)) => warn!("[Gateway] Gateway task join error: {}", e),
-        Err(_) => {
-            warn!(
-                "[Gateway] Graceful shutdown timed out after 2s — aborting task \
-                 (listener socket may briefly linger in kernel)"
-            );
-            abort.abort();
-        }
-    }
-}
-
-/// Upper bound on draining the backend pool when the gateway goes down.
-///
-/// Each client close is itself bounded (1.5s); this caps the extra time spent
-/// waiting on connects that were already in flight.
-const POOL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Tear down a gateway taken out of [`GatewayAppState`]: close its listener
-/// and drain its backend pool, concurrently and both bounded.
-///
-/// Running them side by side keeps the app-exit path inside its ~2.5s budget,
-/// and closes the listener while backends are going away instead of serving
-/// requests that can only fail.
-pub(crate) async fn shutdown_gateway_runtime(
-    handle: Option<mcpmux_gateway::GatewayServerHandle>,
-    pool_service: Option<Arc<PoolService>>,
-) {
-    let drain_pool = async {
-        if let Some(pool) = pool_service {
-            if tokio::time::timeout(POOL_SHUTDOWN_TIMEOUT, pool.shutdown())
-                .await
-                .is_err()
-            {
-                warn!(
-                    "[Gateway] Backend pool did not drain within {:?}; continuing shutdown",
-                    POOL_SHUTDOWN_TIMEOUT
-                );
-            }
-        }
-    };
-    let close_listener = async {
-        if let Some(h) = handle {
-            shutdown_gateway_handle(h).await;
-        }
-    };
-    tokio::join!(drain_pool, close_listener);
-}
-
 /// Bring the main webview window forward so the user sees a popup the
 /// gateway just emitted. Best-effort — silently no-ops when the window
 /// doesn't exist (rare, e.g. during teardown). Used by the approval
@@ -1160,7 +1090,7 @@ pub async fn stop_gateway(
     };
 
     info!("[Gateway] Stop requested — shutting down gracefully");
-    shutdown_gateway_runtime(handle, pool_service).await;
+    mcpmux_runtime::shutdown_gateway_runtime(handle, pool_service).await;
 
     if let Err(e) = app_handle.emit("gateway-changed", serde_json::json!({"action": "stopped"})) {
         warn!("[Gateway] Failed to emit gateway-changed(stopped): {}", e);
@@ -1517,7 +1447,7 @@ pub async fn restart_gateway(
         state.bound_port = None;
         (handle, pool_service)
     };
-    shutdown_gateway_runtime(handle, pool_service).await;
+    mcpmux_runtime::shutdown_gateway_runtime(handle, pool_service).await;
 
     // Start with new config
     start_gateway(
