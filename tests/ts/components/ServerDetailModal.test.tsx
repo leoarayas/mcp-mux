@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { ServerDetailModal } from '../../../apps/desktop/src/features/registry/ServerDetailModal';
-import type { ServerViewModel } from '../../../apps/desktop/src/types/registry';
+import type { AuthConfig, ServerViewModel } from '../../../apps/desktop/src/types/registry';
 
 function makeServer(overrides: Partial<ServerViewModel> = {}): ServerViewModel {
   return {
@@ -105,6 +105,25 @@ describe('ServerDetailModal', () => {
     const server = makeServer({ is_installed: true });
     render(<ServerDetailModal server={server} {...defaultProps} />);
     expect(screen.getByText('Uninstall')).toBeInTheDocument();
+  });
+
+  it.each<[AuthConfig, string]>([
+    [{ type: 'none' }, '✅ No authentication required'],
+    [{ type: 'api_key', instructions: null }, '🔑 API Key Required'],
+    [{ type: 'optional_api_key', instructions: null }, '🔑 API Key (Optional)'],
+    [{ type: 'basic', instructions: null }, '🔑 Username & Password Required'],
+    [{ type: 'oauth' }, '🔐 OAuth Authentication'],
+  ])('should label auth %j as "%s"', (auth, label) => {
+    render(<ServerDetailModal server={makeServer({ auth })} {...defaultProps} />);
+    expect(screen.getByText(label)).toBeInTheDocument();
+  });
+
+  it('should render basic auth instructions', () => {
+    const server = makeServer({
+      auth: { type: 'basic', instructions: 'Use your dashboard username and password.' },
+    });
+    render(<ServerDetailModal server={server} {...defaultProps} />);
+    expect(screen.getByText('Use your dashboard username and password.')).toBeInTheDocument();
   });
 
   it('should render View JSON button in footer', () => {

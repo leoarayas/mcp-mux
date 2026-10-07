@@ -1136,7 +1136,9 @@ export function ServersPage() {
                                   ? '🔑 API Key'
                                   : server.auth.type === 'optional_api_key'
                                     ? '🔑 API Key (Optional)'
-                                    : 'Auth Required'}
+                                    : server.auth.type === 'basic'
+                                      ? '🔑 Username & Password'
+                                      : 'Auth Required'}
                             </span>
                           )}
 

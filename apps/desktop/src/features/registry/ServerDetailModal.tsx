@@ -174,6 +174,8 @@ export function ServerDetailModal({
                     ? 'bg-[rgb(var(--warning))] text-white'
                     : server.auth?.type === 'optional_api_key'
                     ? 'bg-[rgb(var(--warning))]/80 text-white'
+                    : server.auth?.type === 'basic'
+                    ? 'bg-[rgb(var(--warning))] text-white'
                     : 'bg-[rgb(var(--info))] text-white'
                 }`}
               >
@@ -183,6 +185,8 @@ export function ServerDetailModal({
                   ? '🔑 API Key Required'
                   : server.auth?.type === 'optional_api_key'
                   ? '🔑 API Key (Optional)'
+                  : server.auth?.type === 'basic'
+                  ? '🔑 Username & Password Required'
                   : '🔐 OAuth Authentication'}
               </span>
               {server.auth && 'instructions' in server.auth && server.auth.instructions && (

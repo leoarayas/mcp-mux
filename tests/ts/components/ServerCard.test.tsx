@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ServerCard } from '../../../apps/desktop/src/features/registry/ServerCard';
-import type { ServerViewModel } from '../../../apps/desktop/src/types/registry';
+import type { AuthConfig, ServerViewModel } from '../../../apps/desktop/src/types/registry';
 
 function makeServer(overrides: Partial<ServerViewModel> = {}): ServerViewModel {
   return {
@@ -104,6 +104,19 @@ describe('ServerCard', () => {
       });
       render(<ServerCard server={server} {...defaultProps} />);
       expect(screen.getByText('+1')).toBeInTheDocument();
+    });
+  });
+
+  describe('auth badge', () => {
+    it.each<[AuthConfig, string]>([
+      [{ type: 'none' }, 'No Auth'],
+      [{ type: 'api_key', instructions: null }, 'API Key'],
+      [{ type: 'optional_api_key', instructions: null }, 'API Key (Optional)'],
+      [{ type: 'basic', instructions: null }, 'Username & Password'],
+      [{ type: 'oauth' }, 'OAuth'],
+    ])('labels %j as "%s"', (auth, label) => {
+      render(<ServerCard server={makeServer({ auth })} {...defaultProps} />);
+      expect(screen.getByText(label)).toBeInTheDocument();
     });
   });
 

@@ -263,7 +263,11 @@ export function ServerInstallModal() {
               </span>
               {server.auth && server.auth.type !== 'none' && (
                 <span className="px-2 py-0.5 text-xs rounded-full bg-amber-500/10 text-amber-600 border border-amber-500/20">
-                  {server.auth.type === 'oauth' ? 'OAuth' : 'API Key'}
+                  {server.auth.type === 'oauth'
+                    ? 'OAuth'
+                    : server.auth.type === 'basic'
+                      ? 'Username & Password'
+                      : 'API Key'}
                 </span>
               )}
             </div>
