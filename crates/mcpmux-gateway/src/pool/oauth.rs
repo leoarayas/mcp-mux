@@ -3,7 +3,9 @@
 //! Uses rmcp's OAuthState state machine for the complete OAuth flow:
 //! - Metadata discovery (RFC 8414 + RFC 9728)
 //! - Client ID Metadata Document (CIMD) when the authorization server advertises
-//!   `client_id_metadata_document_supported`, otherwise Dynamic Client Registration (DCR)
+//!   `client_id_metadata_document_supported`, otherwise Dynamic Client Registration (DCR),
+//!   which McpMux performs itself (see `oauth_registration`) so it can send its logo
+//!   and keep any client secret the server issues
 //! - PKCE authorization flow
 //! - Automatic token refresh
 //!
@@ -30,6 +32,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::credential_store::DatabaseCredentialStore;
+use super::oauth_registration::{self, RegisteredClient};
 use super::oauth_utils;
 
 /// Default OAuth timeout (5 minutes for user to complete browser auth)
@@ -261,9 +264,173 @@ impl OutboundOAuthManager {
             .unwrap_or(false)
     }
 
+    /// Whether the authorization server supports the authorization code flow McpMux
+    /// uses. `response_types_supported` is optional (RFC 8414); only a list without
+    /// "code" rules it out, matching rmcp's check before its own registration.
+    fn supports_authorization_code(metadata: &mcpmux_core::StoredOAuthMetadata) -> bool {
+        metadata
+            .response_types_supported
+            .as_ref()
+            .is_none_or(|types| types.iter().any(|t| t == "code"))
+    }
+
+    /// The OAuth error code of a failed code exchange (RFC 6749 §5.2), e.g.
+    /// `invalid_grant`. rmcp passes on oauth2's message as text:
+    /// "Server returned error response: <code>[: <description>][ (see <uri>)]".
+    fn token_error_code(error: &AuthError) -> Option<&str> {
+        let AuthError::TokenExchangeFailed(msg) = error else {
+            return None;
+        };
+        msg.strip_prefix("Server returned error response: ")?
+            .split([':', ' '])
+            .next()
+            .filter(|code| !code.is_empty())
+    }
+
+    /// Whether a failed code exchange means the server no longer accepts the client
+    /// (`invalid_client`, RFC 6749 §5.2), so its registration can't be used again.
+    /// Other failures (network errors, 5xx, `invalid_grant` for an expired or reused
+    /// code, a failed save) say nothing about the registration. Only the error code
+    /// counts: a description or error URI that mentions invalid_client doesn't.
+    fn is_invalid_client(error: &AuthError) -> bool {
+        Self::token_error_code(error) == Some("invalid_client")
+    }
+
+    /// Drop the stored client registration, and the tokens issued to it, after the
+    /// server answered `invalid_client` for `client_id`. Only if that client is still
+    /// the stored one: a sign-in started meanwhile may have registered another, and
+    /// its registration must stay. Returns whether anything was dropped.
+    async fn drop_rejected_client(
+        backend_oauth_repo: &dyn OutboundOAuthRepository,
+        credential_repo: &dyn CredentialRepository,
+        space_id: Uuid,
+        server_id: &str,
+        client_id: &str,
+    ) -> anyhow::Result<bool> {
+        let stored = backend_oauth_repo
+            .get_client_id(&space_id, server_id)
+            .await?;
+        if stored.as_deref() != Some(client_id) {
+            return Ok(false);
+        }
+        backend_oauth_repo.delete(&space_id, server_id).await?;
+        credential_repo.clear_tokens(&space_id, server_id).await?;
+        Ok(true)
+    }
+
     /// Convert scope Vec to slice references for RMCP API
     fn scopes_as_refs(scopes: &[String]) -> Vec<&str> {
         scopes.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// The registration to store for a client McpMux just registered (`client` for
+    /// DCR, `None` for a CIMD client_id)
+    fn new_registration(
+        space_id: Uuid,
+        server_id: &str,
+        server_url: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        metadata: Option<&mcpmux_core::StoredOAuthMetadata>,
+        client: Option<&RegisteredClient>,
+    ) -> mcpmux_core::OutboundOAuthRegistration {
+        let registration = match metadata {
+            Some(metadata) => mcpmux_core::OutboundOAuthRegistration::with_metadata(
+                space_id,
+                server_id,
+                server_url,
+                client_id,
+                redirect_uri,
+                metadata.clone(),
+            ),
+            None => mcpmux_core::OutboundOAuthRegistration::new(
+                space_id,
+                server_id,
+                server_url,
+                client_id,
+                redirect_uri,
+            ),
+        };
+        match client {
+            Some(client) => registration
+                .with_client_secret(client.client_secret.clone())
+                .with_client_secret_expires_at(client.client_secret_expires_at)
+                .with_token_endpoint_auth_method(client.token_endpoint_auth_method.clone()),
+            None => registration,
+        }
+    }
+
+    /// Save a new client registration, logging the outcome
+    async fn save_registration(
+        &self,
+        backend_oauth_repo: &dyn OutboundOAuthRepository,
+        registration: &mcpmux_core::OutboundOAuthRegistration,
+    ) -> anyhow::Result<()> {
+        let space_id_str = registration.space_id.to_string();
+        let server_id = registration.server_id.as_str();
+        match backend_oauth_repo.save(registration).await {
+            Ok(()) => {
+                info!(
+                    "[OAuth] Saved new registration for {}/{} with redirect_uri={:?}",
+                    space_id_str, server_id, registration.redirect_uri
+                );
+                self.log(
+                    &space_id_str,
+                    server_id,
+                    LogLevel::Info,
+                    format!(
+                        "Saved client registration (client_id: {})",
+                        registration.client_id
+                    ),
+                    Some(serde_json::json!({
+                        "client_id": registration.client_id,
+                        "redirect_uri": registration.redirect_uri,
+                    })),
+                )
+                .await;
+                Ok(())
+            }
+            Err(e) => {
+                error!("[OAuth] Failed to save registration: {}", e);
+                self.log(
+                    &space_id_str,
+                    server_id,
+                    LogLevel::Error,
+                    format!("Failed to save client registration: {}", e),
+                    Some(serde_json::json!({"error": e.to_string()})),
+                )
+                .await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Configure `manager` with an already-registered client and start an
+    /// authorization session for it, without going through rmcp's registration.
+    /// `metadata` is the authorization server metadata already set on `manager`.
+    async fn session_for_client(
+        mut manager: AuthorizationManager,
+        metadata: &mcpmux_core::StoredOAuthMetadata,
+        client: &RegisteredClient,
+        redirect_uri: &str,
+        scopes: &[String],
+    ) -> Result<AuthorizationSession, AuthError> {
+        oauth_utils::configure_registered_client(
+            &mut manager,
+            Some(metadata),
+            client,
+            redirect_uri,
+            scopes,
+        )?;
+
+        let auth_url = manager
+            .get_authorization_url(&Self::scopes_as_refs(scopes))
+            .await?;
+        Ok(AuthorizationSession::for_scope_upgrade(
+            manager,
+            auth_url,
+            redirect_uri,
+        ))
     }
 
     /// Subscribe to OAuth completion events
@@ -766,12 +933,22 @@ impl OutboundOAuthManager {
             server_id,
             server_url,
             credential_repo,
-            backend_oauth_repo,
+            backend_oauth_repo.clone(),
         );
         manager.set_credential_store(store);
 
-        // Try to initialize from stored credentials
-        if manager.initialize_from_store().await.unwrap_or(false) {
+        // Try to initialize from stored credentials, client secret included
+        let registration = backend_oauth_repo
+            .get(&space_id, server_id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("[OAuth] Failed to load client registration: {}", e);
+                None
+            });
+        if oauth_utils::initialize_from_store(&mut manager, registration.as_ref())
+            .await
+            .unwrap_or(false)
+        {
             debug!(
                 "[OAuth] Initialized from stored credentials for {}/{}",
                 space_id, server_id
@@ -902,12 +1079,20 @@ impl OutboundOAuthManager {
             callback_port, redirect_uri
         );
 
-        // Check for existing client_id (from previous DCR)
+        // Check for existing client_id (from previous DCR). A registration that can't
+        // be read (e.g. its client secret no longer decrypts) counts as none, so a
+        // fresh registration replaces it.
         let existing_registration = backend_oauth_repo
             .get(&space_id, server_id)
             .await
-            .ok()
-            .flatten();
+            .unwrap_or_else(|e| {
+                warn!(
+                    "[OAuth] Can't read the client registration for {}/{}, \
+                     registering a new client: {}",
+                    space_id, server_id, e
+                );
+                None
+            });
 
         // Create OAuthState using the SDK (this performs metadata discovery/handshake)
         self.log(
@@ -960,19 +1145,28 @@ impl OutboundOAuthManager {
         // e.g., "McpMux (Work)" vs "McpMux (Personal)"
         let client_name = self.get_client_name_for_space(space_id).await;
 
-        // Check if we can reuse existing DCR (redirect_uri must match)
-        let can_reuse_dcr = existing_registration
+        // Check if we can reuse existing DCR: redirect_uri must match, and a client
+        // secret must not expire before the code exchange, at most `timeout` away
+        let exchange_deadline =
+            chrono::Utc::now() + chrono::Duration::from_std(self.timeout).unwrap_or_default();
+        let secret_expired = existing_registration
             .as_ref()
-            .map(|reg| reg.matches_redirect_uri(&redirect_uri))
-            .unwrap_or(false);
+            .is_some_and(|reg| reg.client_secret_expired_by(exchange_deadline));
+        let can_reuse_dcr = !secret_expired
+            && existing_registration
+                .as_ref()
+                .is_some_and(|reg| reg.matches_redirect_uri(&redirect_uri));
 
-        // Track whether this is a new registration and capture discovered metadata
-        let (is_new_registration, discovered_metadata): (
-            bool,
-            Option<mcpmux_core::StoredOAuthMetadata>,
-        ) = if can_reuse_dcr {
+        // The client from our own DCR, with its secret if the server issued one. rmcp
+        // keeps the secret only in memory, so it's saved with the registration.
+        let mut registered_client: Option<RegisteredClient> = None;
+        // The client_id this sign-in uses, so a failed exchange drops only that client
+        let flow_client_id: String;
+
+        if can_reuse_dcr {
             // REUSE EXISTING CLIENT_ID - redirect_uri matches!
             let reg = existing_registration.as_ref().unwrap();
+            flow_client_id = reg.client_id.clone();
             info!(
                 "[OAuth] Reusing existing client_id={} for {}/{} (redirect_uri matches)",
                 reg.client_id, space_id, server_id
@@ -1029,24 +1223,36 @@ impl OutboundOAuthManager {
                 // Get scopes from discovered metadata
                 let scopes = Self::get_scopes_from_metadata(&discovered_metadata);
 
-                // Then configure client with the existing registration
-                let mut config = rmcp::transport::auth::OAuthClientConfig::new(
-                    reg.client_id.clone(),
-                    redirect_uri.clone(),
+                // Configure the existing registration, with its client secret if the
+                // server issued one, and start the session without registering again
+                let taken_manager = std::mem::replace(
+                    manager,
+                    AuthorizationManager::new(server_url)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed: {}", e))?,
                 );
-                config.scopes = scopes.clone();
-
-                if let Err(e) = manager.configure_client(config) {
-                    self.log(
-                        &space_id_str,
-                        server_id,
-                        LogLevel::Error,
-                        format!("Failed to configure existing client: {}", e),
-                        Some(serde_json::json!({"error": e.to_string()})),
-                    )
-                    .await;
-                    return Err(anyhow::anyhow!("Failed to configure client: {}", e));
-                }
+                let session = match Self::session_for_client(
+                    taken_manager,
+                    &discovered_metadata,
+                    &RegisteredClient::from(reg),
+                    &redirect_uri,
+                    &scopes,
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(e) => {
+                        self.log(
+                            &space_id_str,
+                            server_id,
+                            LogLevel::Error,
+                            format!("Failed to configure existing client: {}", e),
+                            Some(serde_json::json!({"error": e.to_string()})),
+                        )
+                        .await;
+                        return Err(anyhow::anyhow!("Failed to configure client: {}", e));
+                    }
+                };
 
                 self.log(
                     &space_id_str,
@@ -1057,40 +1263,25 @@ impl OutboundOAuthManager {
                 )
                 .await;
 
-                // Generate authorization URL with server-supported scopes
-                let scope_refs = Self::scopes_as_refs(&scopes);
-                let auth_url = manager
-                    .get_authorization_url(&scope_refs)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to get auth URL: {}", e))?;
-
-                // Create session manually (reusing the existing registration).
-                // We already called configure_client + get_authorization_url above,
-                // so we use `for_scope_upgrade` to wrap the pre-computed values without
-                // re-registering the client via DCR.
-                let taken_manager = std::mem::replace(
-                    manager,
-                    rmcp::transport::auth::AuthorizationManager::new(server_url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed: {}", e))?,
-                );
-                oauth_state = OAuthState::Session(
-                    rmcp::transport::auth::AuthorizationSession::for_scope_upgrade(
-                        taken_manager,
-                        auth_url.clone(),
-                        &redirect_uri,
-                    ),
-                );
+                oauth_state = OAuthState::Session(session);
             }
-            (false, None) // Not a new registration, no metadata to save
         } else {
-            // Need fresh DCR - either no existing registration OR port changed
+            // Need fresh DCR - no existing registration, port changed, or secret expired
             if let Some(ref reg) = existing_registration {
-                warn!(
-                    "[OAuth] Port changed! Old redirect_uri={:?}, new={} - deleting old DCR and re-registering",
-                    reg.redirect_uri, redirect_uri
-                );
-                // Delete old registration since port changed
+                if secret_expired {
+                    warn!(
+                        "[OAuth] Client secret of client_id={} expired - \
+                         deleting old DCR and re-registering",
+                        reg.client_id
+                    );
+                } else {
+                    warn!(
+                        "[OAuth] Port changed! Old redirect_uri={:?}, new={} - \
+                         deleting old DCR and re-registering",
+                        reg.redirect_uri, redirect_uri
+                    );
+                }
+                // Delete the old registration since it can't be reused
                 if let Err(e) = backend_oauth_repo.delete(&space_id, server_id).await {
                     warn!("[OAuth] Failed to delete old DCR: {}", e);
                 }
@@ -1181,16 +1372,101 @@ impl OutboundOAuthManager {
                 .await;
             }
 
-            match AuthorizationSession::new(
-                manager,
-                &scope_refs,
-                &redirect_uri,
-                Some(&client_name),
-                Some(&client_metadata_url),
-            )
-            .await
-            {
+            let session_result = if uses_cimd {
+                AuthorizationSession::new(
+                    manager,
+                    &scope_refs,
+                    &redirect_uri,
+                    Some(&client_name),
+                    Some(&client_metadata_url),
+                )
+                .await
+            } else {
+                // Register ourselves rather than via rmcp, so the request carries
+                // McpMux's logo_uri/client_uri and we learn the client secret
+                let registration_endpoint = metadata_for_storage
+                    .as_ref()
+                    .and_then(|m| m.registration_endpoint.clone());
+                match (metadata_for_storage.as_ref(), registration_endpoint) {
+                    (_, None) | (None, _) => Err(AuthError::RegistrationFailed(
+                        "Dynamic client registration not supported".to_string(),
+                    )),
+                    // Checked before registering, as rmcp's registration did: the
+                    // session would fail afterwards and leave an unused client behind
+                    (Some(metadata), Some(_)) if !Self::supports_authorization_code(metadata) => {
+                        Err(AuthError::RegistrationFailed(
+                            "the authorization server doesn't support the authorization \
+                             code flow (response_types_supported lacks \"code\")"
+                                .to_string(),
+                        ))
+                    }
+                    (Some(metadata), Some(endpoint)) => {
+                        match oauth_registration::register_client(
+                            &endpoint,
+                            &client_name,
+                            &redirect_uri,
+                            &scopes,
+                        )
+                        .await
+                        {
+                            Ok(client) => {
+                                let session = Self::session_for_client(
+                                    manager,
+                                    metadata,
+                                    &client,
+                                    &redirect_uri,
+                                    &scopes,
+                                )
+                                .await;
+                                registered_client = Some(client);
+                                session
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+            };
+
+            match session_result {
                 Ok(session) => {
+                    // Save the new client now, before its code exchange. When the
+                    // tokens arrive, rmcp's credential store saves a bare registration
+                    // (no secret, no metadata) for a client_id it doesn't know yet; a
+                    // connection made before the full one replaced it would refresh
+                    // without the secret. Saved first, the full registration is already
+                    // there and isn't overwritten. A sign-in that's abandoned or fails
+                    // also leaves its client for the next attempt to reuse, instead of
+                    // registering another.
+                    // The client_id comes from our DCR, or is the CIMD URL, which rmcp
+                    // uses as is. It's not read back from the session: that loads the
+                    // stored tokens, which may be stale and unreadable (e.g. after a
+                    // master key reset), and the save would be skipped.
+                    let client_id = match &registered_client {
+                        Some(client) => client.client_id.clone(),
+                        None => client_metadata_url.clone(),
+                    };
+                    let registration = Self::new_registration(
+                        space_id,
+                        server_id,
+                        server_url,
+                        &client_id,
+                        &redirect_uri,
+                        metadata_for_storage.as_ref(),
+                        registered_client.as_ref(),
+                    );
+                    let saved = self
+                        .save_registration(backend_oauth_repo.as_ref(), &registration)
+                        .await;
+                    // Without the saved registration, the tokens would be stored with a
+                    // bare one and every refresh would go out without the secret. A
+                    // public client loses nothing but its metadata, so it carries on.
+                    if let (Err(e), Some(_)) = (saved, registration.client_secret.as_ref()) {
+                        return Err(anyhow::anyhow!(
+                            "Failed to save the new client registration: {}",
+                            e
+                        ));
+                    }
+                    flow_client_id = client_id;
                     oauth_state = OAuthState::Session(session);
                     let message = if uses_cimd {
                         "Client configured with Client ID Metadata Document (CIMD)"
@@ -1242,8 +1518,7 @@ impl OutboundOAuthManager {
                     return Err(anyhow::anyhow!("OAuth flow failed: {}", e));
                 }
             }
-            (true, metadata_for_storage) // New registration with discovered metadata
-        };
+        }
 
         // Get authorization URL
         let auth_url_result = oauth_state.get_authorization_url().await;
@@ -1324,13 +1599,12 @@ impl OutboundOAuthManager {
         let timeout = self.timeout;
         let completion_tx = self.completion_tx.clone();
         let backend_oauth_repo_clone = backend_oauth_repo.clone();
-        let server_url_clone = server_url.to_string();
-        let redirect_uri_clone = redirect_uri.clone();
+        let flow_client_id_clone = flow_client_id.clone();
 
         // Clone log manager for the spawned task
         let log_manager_clone = self.log_manager.clone();
         let space_id_str_clone = space_id_str.clone();
-        let discovered_metadata_clone = discovered_metadata.clone();
+        let credential_repo_clone = credential_repo.clone();
 
         tokio::spawn(async move {
             info!(
@@ -1493,6 +1767,51 @@ impl OutboundOAuthManager {
                                 .await;
                         }
 
+                        // The server rejecting the client (e.g. a confidential client
+                        // saved before McpMux stored client secrets) fails every
+                        // exchange the same way. Drop the registration, and the tokens
+                        // issued to it, so the next attempt registers a fresh client.
+                        // Any other failure says nothing about the registration.
+                        if Self::is_invalid_client(&e) {
+                            let dropped = Self::drop_rejected_client(
+                                backend_oauth_repo_clone.as_ref(),
+                                credential_repo_clone.as_ref(),
+                                space_id,
+                                &server_id_clone,
+                                &flow_client_id_clone,
+                            )
+                            .await;
+                            match dropped {
+                                Ok(false) => info!(
+                                    "[OAuth] Client rejected for {}/{}, but the stored \
+                                     registration is another client now; keeping it",
+                                    space_id, server_id_clone
+                                ),
+                                Ok(true) => {
+                                    warn!(
+                                        "[OAuth] Dropped client registration for {}/{} \
+                                         after invalid_client",
+                                        space_id, server_id_clone
+                                    );
+                                    if let Some(log_manager) = &log_manager_clone {
+                                        let log = ServerLog::new(
+                                            LogLevel::Warn,
+                                            LogSource::OAuth,
+                                            "The server rejected the saved client; dropped it, \
+                                             so the next sign-in registers a new client"
+                                                .to_string(),
+                                        );
+                                        let _ = log_manager
+                                            .append(&space_id_str_clone, &server_id_clone, log)
+                                            .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("[OAuth] Failed to drop client registration: {}", e)
+                                }
+                            }
+                        }
+
                         let _ = completion_tx.send(OAuthCompleteEvent {
                             space_id,
                             server_id: server_id_clone.clone(),
@@ -1511,66 +1830,6 @@ impl OutboundOAuthManager {
                             let _ = log_manager
                                 .append(&space_id_str_clone, &server_id_clone, log)
                                 .await;
-                        }
-
-                        // Save registration if new (includes redirect_uri, port change detection, AND metadata)
-                        if is_new_registration {
-                            if let Ok((client_id, _)) = oauth_state.get_credentials().await {
-                                // Use with_metadata if we have discovered metadata, otherwise use new
-                                let registration =
-                                    if let Some(ref metadata) = discovered_metadata_clone {
-                                        mcpmux_core::OutboundOAuthRegistration::with_metadata(
-                                            space_id,
-                                            &server_id_clone,
-                                            &server_url_clone,
-                                            &client_id,
-                                            &redirect_uri_clone,
-                                            metadata.clone(),
-                                        )
-                                    } else {
-                                        mcpmux_core::OutboundOAuthRegistration::new(
-                                            space_id,
-                                            &server_id_clone,
-                                            &server_url_clone,
-                                            &client_id,
-                                            &redirect_uri_clone,
-                                        )
-                                    };
-                                if let Err(e) = backend_oauth_repo_clone.save(&registration).await {
-                                    error!("[OAuth] Failed to save registration: {}", e);
-                                    if let Some(log_manager) = &log_manager_clone {
-                                        let log = ServerLog::new(
-                                            LogLevel::Error,
-                                            LogSource::OAuth,
-                                            format!("Failed to save client registration: {}", e),
-                                        )
-                                        .with_metadata(serde_json::json!({"error": e.to_string()}));
-                                        let _ = log_manager
-                                            .append(&space_id_str_clone, &server_id_clone, log)
-                                            .await;
-                                    }
-                                } else {
-                                    info!("[OAuth] Saved new registration for {}/{} with redirect_uri={}", 
-                                        space_id, server_id_clone, redirect_uri_clone);
-                                    if let Some(log_manager) = &log_manager_clone {
-                                        let log = ServerLog::new(
-                                            LogLevel::Info,
-                                            LogSource::OAuth,
-                                            format!(
-                                                "Saved client registration (client_id: {})",
-                                                client_id
-                                            ),
-                                        )
-                                        .with_metadata(serde_json::json!({
-                                            "client_id": client_id,
-                                            "redirect_uri": redirect_uri_clone
-                                        }));
-                                        let _ = log_manager
-                                            .append(&space_id_str_clone, &server_id_clone, log)
-                                            .await;
-                                    }
-                                }
-                            }
                         }
 
                         // Mark as completed
@@ -1692,6 +1951,48 @@ impl OutboundOAuthManager {
 impl Default for OutboundOAuthManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod token_error_tests {
+    use super::OutboundOAuthManager;
+    use rmcp::transport::auth::AuthError;
+
+    fn exchange_error(msg: &str) -> AuthError {
+        AuthError::TokenExchangeFailed(msg.to_string())
+    }
+
+    #[test]
+    fn invalid_client_is_read_from_the_error_code() {
+        for msg in [
+            "Server returned error response: invalid_client",
+            "Server returned error response: invalid_client: bad client secret",
+            "Server returned error response: invalid_client (see https://auth.example/e)",
+        ] {
+            assert!(
+                OutboundOAuthManager::is_invalid_client(&exchange_error(msg)),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_client_elsewhere_in_the_message_is_not_the_code() {
+        for msg in [
+            "Server returned error response: invalid_grant: code issued to invalid_client 42",
+            "Server returned error response: invalid_grant (see https://auth.example/invalid_client)",
+            "Server returned error response: invalid_client_metadata",
+            "server returned empty error response",
+        ] {
+            assert!(
+                !OutboundOAuthManager::is_invalid_client(&exchange_error(msg)),
+                "{msg}"
+            );
+        }
+        assert!(!OutboundOAuthManager::is_invalid_client(
+            &AuthError::RegistrationFailed("invalid_client".to_string())
+        ));
     }
 }
 
