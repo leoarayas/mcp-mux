@@ -65,6 +65,19 @@ impl HttpTransport {
         }
     }
 
+    /// `text` with this server's URL (which may carry a key in its query)
+    /// replaced by its log-safe form. Errors from the HTTP stack often quote
+    /// the full request URL.
+    fn without_url(&self, text: String) -> String {
+        if self.url.is_empty() {
+            return text;
+        }
+        text.replace(
+            self.url.as_str(),
+            &mcpmux_core::log_redact::url_for_log(&self.url),
+        )
+    }
+
     /// Header values long enough to be secrets (API keys, tokens), longest
     /// first, for scrubbing the server's own log messages.
     fn header_secrets(&self) -> Arc<Vec<String>> {
@@ -141,7 +154,7 @@ impl HttpTransport {
             LogSource::HttpRequest,
             format!(
                 "Connecting to {} with OAuth (auto-refresh enabled, {} custom header(s))",
-                self.url,
+                mcpmux_core::log_redact::url_for_log(&self.url),
                 header_map.len()
             ),
         )
@@ -160,7 +173,7 @@ impl HttpTransport {
         let mut auth_manager = match AuthorizationManager::new(&self.url).await {
             Ok(m) => m,
             Err(e) => {
-                let err = format!("Failed to create auth manager: {}", e);
+                let err = self.without_url(format!("Failed to create auth manager: {}", e));
                 error!(server_id = %self.server_id, "{}", err);
                 self.log(LogLevel::Error, LogSource::HttpRequest, err.clone())
                     .await;
@@ -249,7 +262,7 @@ impl HttpTransport {
             }
             Err(e) => {
                 // Metadata is pinned, so rmcp didn't need to discover it.
-                let err = format!("OAuth initialization failed: {}", e);
+                let err = self.without_url(format!("OAuth initialization failed: {}", e));
                 error!(server_id = %self.server_id, "{}", err);
                 self.log(LogLevel::Error, LogSource::OAuth, err.clone())
                     .await;
@@ -307,7 +320,7 @@ impl HttpTransport {
                         server_url: self.url.clone(),
                     }
                 } else {
-                    let err = format!("HTTP auth connection failed: {}", e);
+                    let err = self.without_url(format!("HTTP auth connection failed: {}", e));
                     error!(server_id = %self.server_id, "{}", err);
                     self.log(LogLevel::Error, LogSource::HttpResponse, err.clone())
                         .await;
@@ -366,7 +379,10 @@ impl HttpTransport {
         self.log(
             LogLevel::Info,
             LogSource::HttpRequest,
-            format!("Connecting to {} with manual token injection", self.url),
+            format!(
+                "Connecting to {} with manual token injection",
+                mcpmux_core::log_redact::url_for_log(&self.url)
+            ),
         )
         .await;
 
@@ -431,7 +447,8 @@ impl HttpTransport {
                         server_url: self.url.clone(),
                     }
                 } else {
-                    let err = format!("HTTP connection with manual token failed: {}", e);
+                    let err = self
+                        .without_url(format!("HTTP connection with manual token failed: {}", e));
                     error!(server_id = %self.server_id, "{}", err);
                     self.log(LogLevel::Error, LogSource::HttpResponse, err.clone())
                         .await;
@@ -503,7 +520,7 @@ impl HttpTransport {
             LogSource::HttpRequest,
             format!(
                 "Connecting to {} without auth ({} custom header(s))",
-                self.url,
+                mcpmux_core::log_redact::url_for_log(&self.url),
                 header_map.len()
             ),
         )
@@ -556,7 +573,7 @@ impl HttpTransport {
                         server_url: self.url.clone(),
                     }
                 } else {
-                    let err = format!("HTTP connection failed: {}", e);
+                    let err = self.without_url(format!("HTTP connection failed: {}", e));
                     error!(server_id = %self.server_id, "{}", err);
                     self.log(LogLevel::Error, LogSource::HttpResponse, err.clone())
                         .await;
@@ -579,14 +596,17 @@ impl Transport for HttpTransport {
     async fn connect(&self) -> TransportConnectResult {
         info!(
             server_id = %self.server_id,
-            url = %self.url,
+            url = %mcpmux_core::log_redact::url_for_log(&self.url),
             "Connecting to HTTP server"
         );
 
         self.log(
             LogLevel::Info,
             LogSource::Connection,
-            format!("Connecting to HTTP server: {}", self.url),
+            format!(
+                "Connecting to HTTP server: {}",
+                mcpmux_core::log_redact::url_for_log(&self.url)
+            ),
         )
         .await;
 

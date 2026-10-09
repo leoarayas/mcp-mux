@@ -2982,6 +2982,7 @@ dependencies = [
  "dirs 5.0.1",
  "fs2",
  "futures",
+ "libc",
  "mcpmux-core",
  "mcpmux-gateway",
  "mcpmux-storage",

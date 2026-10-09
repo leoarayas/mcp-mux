@@ -1265,10 +1265,11 @@ impl ServerManager {
             error!("[ServerManager] Refusing to open an authorization URL that isn't https");
             return false;
         };
-        info!(url = %url, "[ServerManager] Opening browser for OAuth");
+        let logged_url = mcpmux_core::log_redact::url_for_log(url.as_str());
+        info!(url = %logged_url, "[ServerManager] Opening browser for OAuth");
 
         if let Err(e) = open_url_no_flash(url.as_str()) {
-            error!(url = %url, error = %e, "[ServerManager] Failed to open browser");
+            error!(url = %logged_url, error = %e, "[ServerManager] Failed to open browser");
         }
         true
     }

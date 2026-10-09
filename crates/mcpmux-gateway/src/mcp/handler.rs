@@ -109,7 +109,7 @@ impl McpMuxGatewayHandler {
             Ok(resolved) => {
                 info!(
                     %client_id,
-                    session_id = session_id.unwrap_or("<none>"),
+                    session_id = %session_id.map(mcpmux_core::log_redact::id_for_log).unwrap_or_else(|| "<none>".into()),
                     feature_set_ids = ?resolved.feature_set_ids,
                     space_id = resolved.space_id.map(|u| u.to_string()).unwrap_or_else(|| "<none>".into()),
                     source = ?resolved.source,
@@ -291,7 +291,7 @@ impl McpMuxGatewayHandler {
                     .set(sid, uris.iter().map(|s| s.as_str()));
                 debug!(
                     %client_id,
-                    session_id = %sid,
+                    session_id = %mcpmux_core::log_redact::id_for_log(sid),
                     roots = ?uris,
                     "[FeatureSetResolver] on-demand probe populated roots",
                 );
@@ -326,7 +326,7 @@ impl McpMuxGatewayHandler {
             Ok(Err(e)) => {
                 debug!(
                     %client_id,
-                    session_id = %sid,
+                    session_id = %mcpmux_core::log_redact::id_for_log(sid),
                     error = %e,
                     "[FeatureSetResolver] on-demand probe failed (will retry on next request after throttle)",
                 );
@@ -334,7 +334,7 @@ impl McpMuxGatewayHandler {
             Err(_elapsed) => {
                 debug!(
                     %client_id,
-                    session_id = %sid,
+                    session_id = %mcpmux_core::log_redact::id_for_log(sid),
                     budget_ms = PROBE_BUDGET.as_millis(),
                     "[FeatureSetResolver] on-demand probe timed out (will retry on next request after throttle)",
                 );
@@ -551,7 +551,7 @@ impl ServerHandler for McpMuxGatewayHandler {
                                 if attempt >= max_attempts {
                                     warn!(
                                         client_id = %client_id_str,
-                                        session_id = %session_id_for_task,
+                                        session_id = %mcpmux_core::log_redact::id_for_log(&session_id_for_task),
                                         attempts = attempt,
                                         error = %e,
                                         "[FeatureSetResolver] peer.list_roots() exhausted retries; session left unresolved (next list/get request will re-probe)",
@@ -561,7 +561,7 @@ impl ServerHandler for McpMuxGatewayHandler {
                                 let backoff = BACKOFFS_MS[attempt - 1];
                                 warn!(
                                     client_id = %client_id_str,
-                                    session_id = %session_id_for_task,
+                                    session_id = %mcpmux_core::log_redact::id_for_log(&session_id_for_task),
                                     attempt,
                                     max_attempts,
                                     next_backoff_ms = backoff,
@@ -580,7 +580,7 @@ impl ServerHandler for McpMuxGatewayHandler {
                     session_roots.set(&session_id_for_task, uris.iter().map(|s| s.as_str()));
                     debug!(
                         client_id = %client_id_str,
-                        session_id = %session_id_for_task,
+                        session_id = %mcpmux_core::log_redact::id_for_log(&session_id_for_task),
                         roots = ?uris,
                         attempts = attempt + 1,
                         "[FeatureSetResolver] fetched MCP roots",
@@ -674,7 +674,7 @@ impl ServerHandler for McpMuxGatewayHandler {
                     session_roots.set(&session_id_for_task, uris.iter().map(|s| s.as_str()));
                     debug!(
                         client_id = %client_id_str,
-                        session_id = %session_id_for_task,
+                        session_id = %mcpmux_core::log_redact::id_for_log(&session_id_for_task),
                         roots = ?uris,
                         "[FeatureSetResolver] refreshed MCP roots (roots/list_changed)",
                     );
@@ -703,7 +703,7 @@ impl ServerHandler for McpMuxGatewayHandler {
                 Err(e) => {
                     debug!(
                         client_id = %client_id_str,
-                        session_id = %session_id_for_task,
+                        session_id = %mcpmux_core::log_redact::id_for_log(&session_id_for_task),
                         error = %e,
                         "[FeatureSetResolver] refresh list_roots failed — silent",
                     );

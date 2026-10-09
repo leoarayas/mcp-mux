@@ -62,7 +62,10 @@ pub struct PendingInitialDeepLink {
 pub fn route_or_buffer_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) {
     match app.try_state::<PendingInitialDeepLink>() {
         Some(pending) if !pending.webview_ready.load(Ordering::Acquire) => {
-            info!("[DeepLink] Webview not ready — buffering URL: {}", url);
+            info!(
+                "[DeepLink] Webview not ready — buffering URL: {}",
+                mcpmux_core::log_redact::url_for_log(url)
+            );
             if let Ok(mut guard) = pending.url.lock() {
                 *guard = Some(url.to_string());
             }
@@ -79,7 +82,10 @@ pub fn flush_pending_deep_link(app: tauri::AppHandle, pending: State<'_, Pending
     pending.webview_ready.store(true, Ordering::Release);
     let buffered = pending.url.lock().ok().and_then(|mut g| g.take());
     if let Some(url) = buffered {
-        info!("[DeepLink] Flushing buffered cold-start URL: {}", url);
+        info!(
+            "[DeepLink] Flushing buffered cold-start URL: {}",
+            mcpmux_core::log_redact::url_for_log(&url)
+        );
         handle_deep_link(&app, &url);
     }
 }
@@ -176,7 +182,10 @@ fn deep_link_is_duplicate(url: &str) -> bool {
 /// Outbound OAuth callbacks never come through here: they go to the
 /// loopback callback server.
 pub fn handle_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) {
-    info!("[DeepLink] Received: {}", url);
+    info!(
+        "[DeepLink] Received: {}",
+        mcpmux_core::log_redact::url_for_log(url)
+    );
 
     // Validate URL scheme
     if !branding::is_deep_link(url) {
@@ -191,7 +200,10 @@ pub fn handle_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str)
     // deliver for the same warm-launch URL — otherwise the consent modal and
     // `get_pending_consent` fire twice per approval.
     if deep_link_is_duplicate(url) {
-        info!("[DeepLink] Ignoring duplicate within {DEEP_LINK_DEDUP_WINDOW:?}: {url}");
+        info!(
+            "[DeepLink] Ignoring duplicate within {DEEP_LINK_DEDUP_WINDOW:?}: {}",
+            mcpmux_core::log_redact::url_for_log(url)
+        );
         return;
     }
 
@@ -240,7 +252,7 @@ fn handle_authorize_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url:
 
     info!(
         "[DeepLink] Authorization request received: request_id='{}'",
-        request_id
+        mcpmux_core::log_redact::id_for_log(&request_id)
     );
 
     // Emit minimal payload - frontend will fetch details from backend
@@ -359,7 +371,7 @@ pub async fn get_pending_consent(
 ) -> Result<ConsentRequestDetails, ConsentError> {
     info!(
         "[OAuth] Fetching pending consent: request_id='{}'",
-        request_id
+        mcpmux_core::log_redact::id_for_log(&request_id)
     );
 
     let app_state = gateway_state.read().await;
@@ -473,7 +485,7 @@ pub async fn approve_oauth_consent(
         } else {
             "denied"
         },
-        request.request_id
+        mcpmux_core::log_redact::id_for_log(&request.request_id)
     );
 
     let app_state = gateway_state.read().await;
@@ -1217,7 +1229,10 @@ fn open_url_no_flash(url: &str) -> Result<(), String> {
 /// For regular http/https URLs to remote hosts, opens in the default browser.
 #[tauri::command]
 pub async fn open_url(url: String) -> Result<(), String> {
-    info!("[OAuth] Processing redirect URL: {}", url);
+    info!(
+        "[OAuth] Processing redirect URL: {}",
+        mcpmux_core::log_redact::url_for_log(&url)
+    );
 
     // Parse the URL to determine how to handle it
     let parsed = Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
@@ -1233,7 +1248,10 @@ pub async fn open_url(url: String) -> Result<(), String> {
     if is_localhost && is_http {
         // For localhost callbacks, make a direct HTTP request
         // This avoids opening a browser window for a cleaner UX
-        info!("[OAuth] Delivering callback directly to localhost: {}", url);
+        info!(
+            "[OAuth] Delivering callback directly to localhost: {}",
+            mcpmux_core::log_redact::url_for_log(&url)
+        );
 
         // The URL carries the authorization code: send it only to the app's
         // loopback listener, not on to wherever that answers with a redirect,
@@ -1264,7 +1282,9 @@ pub async fn open_url(url: String) -> Result<(), String> {
             }
             Err(e) => {
                 // Connection refused likely means the client's server closed
-                // This can happen if the user took too long to approve
+                // This can happen if the user took too long to approve.
+                // The error's URL carries the authorization code: drop it.
+                let e = e.without_url();
                 error!("[OAuth] Failed to deliver callback: {}", e);
                 Err(format!("Failed to deliver OAuth callback. The application may have timed out waiting. Please try again. Error: {}", e))
             }
@@ -1272,9 +1292,16 @@ pub async fn open_url(url: String) -> Result<(), String> {
     } else {
         // For custom protocols (cursor://, vscode://) or remote URLs, use system handler
         // Use ShellExecuteW on Windows to avoid terminal flash
-        info!("[OAuth] Opening URL with system handler: {}", url);
+        info!(
+            "[OAuth] Opening URL with system handler: {}",
+            mcpmux_core::log_redact::url_for_log(&url)
+        );
         open_url_no_flash(&url).map_err(|e| {
-            error!("[OAuth] Failed to open URL '{}': {}", url, e);
+            error!(
+                "[OAuth] Failed to open URL '{}': {}",
+                mcpmux_core::log_redact::url_for_log(&url),
+                e
+            );
             e
         })?;
 
