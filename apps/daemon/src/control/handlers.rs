@@ -385,6 +385,12 @@ async fn doctor(state: &ControlState) -> Result<serde_json::Value, ApiError> {
         }
     });
 
+    // Which master key the stored data is encrypted with.
+    checks.push(check_master_key_source(
+        state.runtime.master_key_source,
+        &state.runtime.keys_dir,
+    ));
+
     // Listener: the gateway is up by the time the control socket exists.
     checks.push(DoctorCheck {
         id: "gateway_listener".into(),
@@ -607,6 +613,53 @@ fn check_key_files(keys_dir: &std::path::Path) -> mcpmux_control::DoctorCheck {
             message: "key permission audit is Unix-only".into(),
             hint: None,
         }
+    }
+}
+
+/// Report where the master key the daemon is using lives (OS keychain or
+/// key file), and a plaintext key file left behind next to a keychain key.
+fn check_master_key_source(
+    source: Option<mcpmux_runtime::master_key::KeySource>,
+    keys_dir: &std::path::Path,
+) -> mcpmux_control::DoctorCheck {
+    use mcpmux_control::{CheckStatus, DoctorCheck};
+    use mcpmux_runtime::master_key::KeySource;
+
+    let check = |status, message: String, hint: Option<&str>| DoctorCheck {
+        id: "master_key".into(),
+        status,
+        message,
+        hint: hint.map(str::to_string),
+    };
+    match source {
+        Some(KeySource::Keychain) if keys_dir.join("master.key").exists() => check(
+            CheckStatus::Warn,
+            format!(
+                "master key: {}; {} also holds a key that isn't in use",
+                KeySource::Keychain,
+                keys_dir.join("master.key").display()
+            ),
+            Some(
+                "that file is a plaintext key on disk; remove it once you're sure no \
+                 stored secrets were written with it",
+            ),
+        ),
+        Some(source @ KeySource::Keychain) => {
+            check(CheckStatus::Ok, format!("master key: {source}"), None)
+        }
+        Some(source @ KeySource::File) => check(
+            CheckStatus::Ok,
+            format!("master key: {source}"),
+            Some(
+                "the key is a file in the data directory; a Secret Service provider \
+                 (e.g. gnome-keyring) keeps it out of the file system",
+            ),
+        ),
+        None => check(
+            CheckStatus::Skip,
+            "master key: DPAPI (Windows)".into(),
+            None,
+        ),
     }
 }
 
@@ -2327,6 +2380,33 @@ async fn port_clear(state: &ControlState) -> Result<serde_json::Value, ApiError>
         default_port: mcpmux_core::DEFAULT_GATEWAY_PORT,
     })
     .expect("PortResponse is serializable"))
+}
+
+#[cfg(test)]
+mod master_key_check_tests {
+    use super::check_master_key_source;
+    use mcpmux_control::CheckStatus;
+    use mcpmux_runtime::master_key::KeySource;
+
+    #[test]
+    fn a_key_file_left_next_to_a_keychain_key_is_flagged() {
+        let keys = tempfile::tempdir().unwrap();
+        let check = check_master_key_source(Some(KeySource::Keychain), keys.path());
+        assert_eq!(check.status, CheckStatus::Ok);
+
+        std::fs::write(keys.path().join("master.key"), b"old").unwrap();
+        let check = check_master_key_source(Some(KeySource::Keychain), keys.path());
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("isn't in use"), "{}", check.message);
+
+        // With the file key in use, that file is the key: not flagged.
+        let check = check_master_key_source(Some(KeySource::File), keys.path());
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(
+            check_master_key_source(None, keys.path()).status,
+            CheckStatus::Skip
+        );
+    }
 }
 
 #[cfg(test)]

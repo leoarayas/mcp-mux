@@ -295,6 +295,7 @@ impl RuntimeBuilder {
             server_log_manager,
             jwt_secret,
             event_bus,
+            master_key_source: key_source,
         }))
     }
 }
@@ -382,6 +383,8 @@ pub struct Runtime {
     pub server_log_manager: Arc<ServerLogManager>,
     pub jwt_secret: Option<Zeroizing<[u8; JWT_SECRET_SIZE]>>,
     pub event_bus: SharedEventBus,
+    /// Where the master key in use is kept (`None` on Windows: DPAPI).
+    pub master_key_source: Option<KeySource>,
 }
 
 impl Runtime {
