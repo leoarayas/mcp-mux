@@ -197,18 +197,69 @@ impl RuntimeBuilder {
 
         let repositories = Repositories::new(database.clone(), encryptor.clone());
 
-        // Server settings saved before they were encrypted at rest.
+        // Credentials and client secrets written before ciphertexts were bound
+        // to where they are stored.
+        let mut rewritten = 0;
+        match database.lock().await.bind_legacy_ciphertexts(&encryptor) {
+            Ok(0) => {}
+            Ok(n) => {
+                rewritten += n;
+                info!(values = n, "[runtime] bound stored secrets to their rows")
+            }
+            Err(e) => tracing::warn!(error = %e, "[runtime] could not bind stored secrets"),
+        }
+
+        // Server settings saved before they were encrypted at rest (or bound).
         match SqliteInstalledServerRepository::new(database.clone(), encryptor.clone())
             .encrypt_plaintext_rows()
             .await
         {
             Ok(0) => {}
-            Ok(n) => info!(
-                rows = n,
-                "[runtime] encrypted server settings stored as plaintext"
-            ),
+            Ok(n) => {
+                rewritten += n;
+                info!(
+                    rows = n,
+                    "[runtime] encrypted and bound server settings from an earlier version"
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "[runtime] could not encrypt plaintext server settings")
+            }
+        }
+
+        // The old forms of rewritten values stay in the WAL until it's
+        // checkpointed.
+        if rewritten > 0 {
+            database.lock().await.checkpoint_wal();
+        }
+
+        // Once every stored secret is bound, refuse unbound ones for good: a
+        // legacy-looking value appearing later wasn't written by McpMux.
+        {
+            let db = database.lock().await;
+            let bound = db.ciphertexts_bound()
+                || match db.unbound_value_count() {
+                    Ok(0) => match db.mark_ciphertexts_bound() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "[runtime] could not record that all secrets are bound");
+                            false
+                        }
+                    },
+                    Ok(n) => {
+                        info!(
+                            values = n,
+                            "[runtime] stored values not yet bound; legacy reads stay on"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[runtime] could not count unbound values");
+                        false
+                    }
+                };
+            if bound {
+                encryptor.require_bound();
             }
         }
 

@@ -17,3 +17,5 @@ mod migrations;
 mod outbound_oauth;
 mod repositories;
 mod space_base_dir;
+
+mod ciphertext_binding;
