@@ -32,7 +32,7 @@ use process_wrap::tokio::{CommandWrap, KillOnDrop, ProcessGroup};
 /// Longest stderr line kept from a stdio server; the rest of the line is
 /// dropped. Without a cap a server writing without newlines grows memory
 /// without bound.
-const MAX_STDERR_LINE: usize = 16 * 1024;
+const MAX_STDERR_LINE: usize = super::MAX_SERVER_LOG_LINE;
 
 /// Kills a stdio server's whole process group when its child handle is
 /// dropped.
@@ -379,6 +379,7 @@ fn spawn_stderr_reader(
     log_manager: Option<Arc<ServerLogManager>>,
     space_id: Uuid,
     server_id: String,
+    redact: Arc<Vec<String>>,
 ) {
     let Some(log_manager) = log_manager else {
         return;
@@ -415,6 +416,7 @@ fn spawn_stderr_reader(
                     break;
                 }
             };
+            let message = super::scrub_secrets(&message, &redact);
             let level = classify_stderr_line(&message);
             let log = ServerLog::new(level, LogSource::Stderr, &message);
             let _ = log_manager.append(&space_id_str, &server_id, log).await;
@@ -500,6 +502,8 @@ pub struct StdioTransport {
     log_manager: Option<Arc<ServerLogManager>>,
     connect_timeout: Duration,
     event_tx: Option<tokio::sync::broadcast::Sender<mcpmux_core::DomainEvent>>,
+    /// Secret values scrubbed from stderr before it is logged.
+    redact: Arc<Vec<String>>,
 }
 
 impl StdioTransport {
@@ -523,7 +527,15 @@ impl StdioTransport {
             log_manager,
             connect_timeout,
             event_tx,
+            redact: Arc::new(Vec::new()),
         }
+    }
+
+    /// Scrub these exact values (the server's own secrets) from its stderr
+    /// before writing it to the server log.
+    pub fn with_redacted_values(mut self, values: Vec<String>) -> Self {
+        self.redact = Arc::new(values);
+        self
     }
 
     /// Log a message to the server log manager.
@@ -638,6 +650,7 @@ impl Transport for StdioTransport {
                 self.log_manager.clone(),
                 self.space_id,
                 self.server_id.clone(),
+                Arc::clone(&self.redact),
             );
         } else {
             warn!(
@@ -652,6 +665,7 @@ impl Transport for StdioTransport {
             self.space_id,
             self.event_tx.clone(),
             self.log_manager.clone(),
+            Arc::clone(&self.redact),
         );
 
         // Connect with timeout
@@ -782,6 +796,25 @@ mod tests {
                 StderrLine::Line("next".into()),
                 StderrLine::Line("last".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn stderr_lines_have_the_servers_secrets_scrubbed() {
+        let secrets = vec![
+            "ghp_longer_secret_value".to_string(),
+            "sk-12345678".to_string(),
+        ];
+        assert_eq!(
+            crate::pool::transport::scrub_secrets(
+                "auth failed for ghp_longer_secret_value (sk-12345678)",
+                &secrets
+            ),
+            "auth failed for [redacted] ([redacted])"
+        );
+        assert_eq!(
+            crate::pool::transport::scrub_secrets("nothing to hide", &secrets),
+            "nothing to hide"
         );
     }
 
