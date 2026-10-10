@@ -135,6 +135,16 @@ export function ConnectIDEsGrid({ gatewayUrl, gatewayRunning }: ConnectIDEsGridP
         'config, then restart the IDE.',
     },
     {
+      id: 'agy',
+      name: 'Google Antigravity',
+      label: 'Antigravity',
+      action: 'copy_config',
+      handler: `"mcpmux": {\n  "url": "${mcpUrl}"\n}`,
+      nextStep:
+        'Copies a JSON snippet. Paste into ~/.gemini/config/mcp_config.json ' +
+        'under "mcpServers", then restart your agent session.',
+    },
+    {
       id: 'copy-config',
       name: 'JSON Config',
       label: 'JSON',
