@@ -19,22 +19,27 @@ use mcpmux_core::{
 };
 use mcpmux_gateway::{DependenciesBuilder, GatewayConfig, GatewayDependencies, GatewayServer};
 use mcpmux_storage::{
-    create_jwt_secret_provider, create_key_provider, Database, FieldEncryptor,
-    InboundClientRepository, JwtSecretProvider, KeychainJwtSecretProvider, KeychainKeyProvider,
-    MasterKeyProvider, SqliteAppSettingsRepository, SqliteCredentialRepository,
-    SqliteFeatureSetRepository, SqliteInboundMcpClientRepository, SqliteInstalledServerRepository,
-    SqliteOutboundOAuthRepository, SqliteServerFeatureRepository, SqliteSpaceBaseDirRepository,
-    SqliteSpaceBuiltinConfigRepository, SqliteSpaceRepository, SqliteWorkspaceBindingRepository,
-    DATABASE_FILE, JWT_SECRET_SIZE,
+    create_jwt_secret_provider, Database, FieldEncryptor, InboundClientRepository,
+    JwtSecretProvider, KeychainJwtSecretProvider, SqliteAppSettingsRepository,
+    SqliteCredentialRepository, SqliteFeatureSetRepository, SqliteInboundMcpClientRepository,
+    SqliteInstalledServerRepository, SqliteOutboundOAuthRepository, SqliteServerFeatureRepository,
+    SqliteSpaceBaseDirRepository, SqliteSpaceBuiltinConfigRepository, SqliteSpaceRepository,
+    SqliteWorkspaceBindingRepository, DATABASE_FILE, JWT_SECRET_SIZE, KEY_SIZE,
 };
+
+#[cfg(windows)]
+use mcpmux_storage::{create_key_provider, KeychainKeyProvider, MasterKeyProvider};
 
 use crate::error::RuntimeError;
 use crate::lock::DataDirLock;
+use crate::master_key::KeySource;
+#[cfg(not(windows))]
+use crate::master_key::OsKeychain;
 use crate::paths::resolve_data_dir;
 
 /// Default registry API URL. Matches the desktop's hard-coded default and
 /// the env-var fallback in `mcpmux_core::service::registry_api_client`.
-pub const DEFAULT_REGISTRY_URL: &str = "https://api.mcpmux.com";
+pub const DEFAULT_REGISTRY_URL: &str = mcpmux_core::OFFICIAL_REGISTRY_URL;
 
 /// Per-file size cap for the server-log manager (10 MiB).
 pub const DEFAULT_SERVER_LOG_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -175,8 +180,7 @@ impl RuntimeBuilder {
         // keychain on a headless host is exactly the kind of problem the
         // user needs to know about, not a silent fallback to a plaintext
         // secret (which the roadmap forbids — see Phase 2 acceptance).
-        let master_key = key_provider(&data_dir, config.key_provider_policy)
-            .and_then(|provider| provider.get_or_create_key())
+        let (master_key, key_source) = master_key(&data_dir, config.key_provider_policy)
             .map_err(|e| RuntimeError::KeyProvider(e.to_string()))?;
         let encryptor = Arc::new(
             FieldEncryptor::new(&master_key)
@@ -190,8 +194,83 @@ impl RuntimeBuilder {
         let database = Database::open(&db_path)
             .map_err(|e| RuntimeError::KeyProvider(format!("database open: {}", e)))?;
         let database = Arc::new(Mutex::new(database));
+        // Installs from before the data directory was made owner-only may
+        // have a world-readable database; tighten it and its WAL files.
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = db_path.clone().into_os_string();
+            path.push(suffix);
+            if let Err(e) = crate::private_dir::restrict_file(std::path::Path::new(&path)) {
+                tracing::warn!(error = %e, "[runtime] could not restrict database file permissions");
+            }
+        }
 
         let repositories = Repositories::new(database.clone(), encryptor.clone());
+
+        // Credentials and client secrets written before ciphertexts were bound
+        // to where they are stored.
+        let mut rewritten = 0;
+        match database.lock().await.bind_legacy_ciphertexts(&encryptor) {
+            Ok(0) => {}
+            Ok(n) => {
+                rewritten += n;
+                info!(values = n, "[runtime] bound stored secrets to their rows")
+            }
+            Err(e) => tracing::warn!(error = %e, "[runtime] could not bind stored secrets"),
+        }
+
+        // Server settings saved before they were encrypted at rest (or bound).
+        match SqliteInstalledServerRepository::new(database.clone(), encryptor.clone())
+            .encrypt_plaintext_rows()
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                rewritten += n;
+                info!(
+                    rows = n,
+                    "[runtime] encrypted and bound server settings from an earlier version"
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "[runtime] could not encrypt plaintext server settings")
+            }
+        }
+
+        // The old forms of rewritten values stay in the WAL until it's
+        // checkpointed.
+        if rewritten > 0 {
+            database.lock().await.checkpoint_wal();
+        }
+
+        // Once every stored secret is bound, refuse unbound ones for good: a
+        // legacy-looking value appearing later wasn't written by McpMux.
+        {
+            let db = database.lock().await;
+            let bound = db.ciphertexts_bound()
+                || match db.unbound_value_count() {
+                    Ok(0) => match db.mark_ciphertexts_bound() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "[runtime] could not record that all secrets are bound");
+                            false
+                        }
+                    },
+                    Ok(n) => {
+                        info!(
+                            values = n,
+                            "[runtime] stored values not yet bound; legacy reads stay on"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[runtime] could not count unbound values");
+                        false
+                    }
+                };
+            if bound {
+                encryptor.require_bound();
+            }
+        }
 
         let app_settings_service =
             Arc::new(AppSettingsService::new(repositories.app_settings.clone()));
@@ -214,9 +293,13 @@ impl RuntimeBuilder {
             Some(d) => d.clone(),
             None => data_dir.join("logs"),
         };
-        std::fs::create_dir_all(&logs_dir).map_err(|source| RuntimeError::DataDirCreate {
-            path: logs_dir.clone(),
-            source,
+        // May live outside the data directory (`--log-dir`), so it gets the
+        // same owner-only treatment itself.
+        crate::private_dir::ensure_private_dir(&logs_dir).map_err(|source| {
+            RuntimeError::DataDirCreate {
+                path: logs_dir.clone(),
+                source,
+            }
         })?;
 
         let log_config = CoreLogConfig {
@@ -233,7 +316,7 @@ impl RuntimeBuilder {
         );
 
         let jwt_secret = if config.load_jwt_secret {
-            match load_jwt_secret(&data_dir, config.key_provider_policy) {
+            match load_jwt_secret(&data_dir, config.key_provider_policy, key_source) {
                 Ok(secret) => {
                     info!("[runtime] JWT signing secret loaded");
                     Some(secret)
@@ -276,6 +359,7 @@ impl RuntimeBuilder {
             server_log_manager,
             jwt_secret,
             event_bus,
+            master_key_source: key_source,
         }))
     }
 }
@@ -308,8 +392,9 @@ impl Repositories {
             db.clone(),
             encryptor.clone(),
         ));
-        let backend_oauth: Arc<dyn OutboundOAuthRepository> =
-            Arc::new(SqliteOutboundOAuthRepository::new(db.clone()));
+        let backend_oauth: Arc<dyn OutboundOAuthRepository> = Arc::new(
+            SqliteOutboundOAuthRepository::new(db.clone(), encryptor.clone()),
+        );
         let feature_set: Arc<dyn FeatureSetRepository> =
             Arc::new(SqliteFeatureSetRepository::new(db.clone()));
         let client: Arc<dyn InboundMcpClientRepository> =
@@ -362,6 +447,8 @@ pub struct Runtime {
     pub server_log_manager: Arc<ServerLogManager>,
     pub jwt_secret: Option<Zeroizing<[u8; JWT_SECRET_SIZE]>>,
     pub event_bus: SharedEventBus,
+    /// Where the master key in use is kept (`None` on Windows: DPAPI).
+    pub master_key_source: Option<KeySource>,
 }
 
 impl Runtime {
@@ -432,20 +519,48 @@ impl Runtime {
     }
 }
 
-fn key_provider(
+/// The master key and where it came from (`None` on Windows, where DPAPI
+/// keeps it next to the data and there is nothing to choose between).
+#[cfg(not(windows))]
+fn master_key(
     data_dir: &Path,
     policy: KeyProviderPolicy,
-) -> anyhow::Result<Box<dyn MasterKeyProvider>> {
-    match policy {
-        KeyProviderPolicy::Auto => create_key_provider(data_dir),
-        KeyProviderPolicy::Keychain => Ok(Box::new(KeychainKeyProvider::new()?)),
-        KeyProviderPolicy::File => file_key_provider(data_dir),
-    }
+) -> anyhow::Result<(Zeroizing<[u8; KEY_SIZE]>, Option<KeySource>)> {
+    let allowed: &[KeySource] = match policy {
+        KeyProviderPolicy::Auto => &[KeySource::Keychain, KeySource::File],
+        KeyProviderPolicy::Keychain => &[KeySource::Keychain],
+        KeyProviderPolicy::File => &[KeySource::File],
+    };
+    // A short-lived handle: deciding needs the stored ciphertexts before the
+    // repositories (which need the key) exist.
+    let database = Database::open(&data_dir.join(DATABASE_FILE))?;
+    let (key, source) =
+        crate::master_key::resolve_master_key(data_dir, &database, allowed, &OsKeychain)?;
+    Ok((key, Some(source)))
 }
 
-#[cfg(not(windows))]
-fn file_key_provider(data_dir: &Path) -> anyhow::Result<Box<dyn MasterKeyProvider>> {
-    Ok(Box::new(mcpmux_storage::FileKeyProvider::new(data_dir)?))
+#[cfg(windows)]
+fn master_key(
+    data_dir: &Path,
+    policy: KeyProviderPolicy,
+) -> anyhow::Result<(Zeroizing<[u8; KEY_SIZE]>, Option<KeySource>)> {
+    let provider: Box<dyn MasterKeyProvider> = match policy {
+        KeyProviderPolicy::Auto => create_key_provider(data_dir)?,
+        KeyProviderPolicy::Keychain => Box::new(KeychainKeyProvider::new()?),
+        KeyProviderPolicy::File => file_key_provider(data_dir)?,
+    };
+    // Never create a new key while stored data needs the old one.
+    let database = Database::open(&data_dir.join(DATABASE_FILE))?;
+    let samples = database.encrypted_samples(crate::master_key::SAMPLE_LIMIT)?;
+    let existing = if provider.key_exists() {
+        Some(provider.get_or_create_key()?)
+    } else {
+        None
+    };
+    let key =
+        crate::master_key::guard_single_key(existing, &samples, || provider.get_or_create_key())?;
+    crate::master_key::warn_if_partly_unreadable(&key, &samples);
+    Ok((key, None))
 }
 
 #[cfg(windows)]
@@ -453,14 +568,19 @@ fn file_key_provider(_data_dir: &Path) -> anyhow::Result<Box<dyn MasterKeyProvid
     anyhow::bail!("the file key provider is not supported on Windows; use auto or keychain")
 }
 
+/// The JWT signing secret lives wherever the master key does, so a keychain
+/// hiccup can't silently switch it to a new file-based secret either.
 fn load_jwt_secret(
     data_dir: &Path,
     policy: KeyProviderPolicy,
+    master_key_source: Option<KeySource>,
 ) -> anyhow::Result<Zeroizing<[u8; JWT_SECRET_SIZE]>> {
-    let provider: Box<dyn JwtSecretProvider> = match policy {
-        KeyProviderPolicy::Auto => create_jwt_secret_provider(data_dir)?,
-        KeyProviderPolicy::Keychain => Box::new(KeychainJwtSecretProvider::new()?),
-        KeyProviderPolicy::File => file_jwt_secret_provider(data_dir)?,
+    let provider: Box<dyn JwtSecretProvider> = match (master_key_source, policy) {
+        (Some(KeySource::Keychain), _) => Box::new(KeychainJwtSecretProvider::new()?),
+        (Some(KeySource::File), _) => file_jwt_secret_provider(data_dir)?,
+        (None, KeyProviderPolicy::Auto) => create_jwt_secret_provider(data_dir)?,
+        (None, KeyProviderPolicy::Keychain) => Box::new(KeychainJwtSecretProvider::new()?),
+        (None, KeyProviderPolicy::File) => file_jwt_secret_provider(data_dir)?,
     };
     provider
         .get_or_create_secret()

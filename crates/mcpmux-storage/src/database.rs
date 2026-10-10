@@ -148,7 +148,37 @@ const MIGRATIONS: &[Migration] = &[
         name: "onboarding_defaults",
         sql: include_str!("migrations/023_onboarding_defaults.sql"),
     },
+    Migration {
+        version: 24,
+        name: "outbound_oauth_client_secret",
+        sql: include_str!("migrations/024_outbound_oauth_client_secret.sql"),
+    },
+    Migration {
+        version: 25,
+        name: "outbound_oauth_client_auth",
+        sql: include_str!("migrations/025_outbound_oauth_client_auth.sql"),
+    },
+    Migration {
+        version: 26,
+        name: "inbound_refresh_families",
+        sql: include_str!("migrations/026_inbound_refresh_families.sql"),
+    },
 ];
+
+/// A stored ciphertext with the context it is bound to (see
+/// [`crate::crypto::binding`]); legacy unbound values ignore the context.
+#[derive(Debug, Clone)]
+pub struct EncryptedSample {
+    pub value: String,
+    pub context: String,
+}
+
+/// `app_settings` key recording that every stored secret is bound.
+const CIPHERTEXTS_BOUND_KEY: &str = "storage.ciphertexts_bound";
+
+/// `app_settings` key recording that the one-time VACUUM after enabling
+/// `secure_delete` ran.
+const SECURE_DELETE_VACUUM_KEY: &str = "storage.secure_delete_vacuumed";
 
 /// SQLite database wrapper.
 pub struct Database {
@@ -173,6 +203,10 @@ impl Database {
         // Enable foreign keys
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
+        // Overwrite deleted content instead of leaving it in free pages, so
+        // a removed credential's ciphertext doesn't stay in the file.
+        conn.pragma_update(None, "secure_delete", "ON")?;
+
         // Set journal mode to WAL for better concurrency
         conn.pragma_update(None, "journal_mode", "WAL")?;
 
@@ -180,8 +214,49 @@ impl Database {
 
         let db = Self { conn };
         db.run_migrations()?;
+        db.vacuum_once();
 
         Ok(db)
+    }
+
+    /// Rewrite the database file once, so pages freed before `secure_delete`
+    /// was turned on (which can still hold old ciphertext) are dropped.
+    /// Recorded in `app_settings`; a failure is retried at the next start.
+    fn vacuum_once(&self) {
+        let done = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM app_settings WHERE key = ?1",
+                [SECURE_DELETE_VACUUM_KEY],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if done {
+            return;
+        }
+        if let Err(e) = self.conn.execute_batch("VACUUM") {
+            tracing::warn!("One-time database VACUUM failed (retried at next start): {e}");
+            return;
+        }
+        if let Err(e) = self.conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?1, 'true', ?2)",
+            rusqlite::params![SECURE_DELETE_VACUUM_KEY, chrono::Utc::now().to_rfc3339()],
+        ) {
+            tracing::warn!("Couldn't record the one-time VACUUM: {e}");
+        }
+        self.checkpoint_wal();
+        tracing::info!("Compacted the database once to drop previously freed pages");
+    }
+
+    /// Whether [`Self::vacuum_once`] has run on this database.
+    pub fn was_vacuumed_once(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM app_settings WHERE key = ?1",
+                [SECURE_DELETE_VACUUM_KEY],
+                |_| Ok(()),
+            )
+            .is_ok()
     }
 
     /// Open an in-memory database (for testing).
@@ -190,6 +265,10 @@ impl Database {
 
         // Enable foreign keys
         conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        // Overwrite deleted content instead of leaving it in free pages, so
+        // a removed credential's ciphertext doesn't stay in the file.
+        conn.pragma_update(None, "secure_delete", "ON")?;
 
         debug!("Opened in-memory database");
 
@@ -361,6 +440,18 @@ impl Database {
         Ok(())
     }
 
+    /// Copy the WAL back into the database file and truncate it, so pages
+    /// that held deleted rows don't linger in `-wal`. Best effort: a busy
+    /// checkpoint just leaves the WAL for the next one.
+    pub fn checkpoint_wal(&self) {
+        if let Err(e) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        {
+            tracing::debug!("WAL checkpoint skipped: {e}");
+        }
+    }
+
     /// Get the current schema version (highest applied migration).
     fn get_schema_version(&self) -> i64 {
         self.conn
@@ -375,6 +466,169 @@ impl Database {
     /// Get a reference to the underlying connection.
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Up to `limit` stored ciphertexts encrypted with the master key:
+    /// credentials, outbound client secrets and server input values (minus
+    /// legacy rows kept as plaintext JSON). Empty when nothing encrypted has
+    /// been stored yet. Used to tell which candidate key the existing data
+    /// was encrypted with.
+    pub fn encrypted_samples(&self, limit: usize) -> Result<Vec<EncryptedSample>> {
+        use crate::crypto::binding;
+        let mut stmt = self.conn.prepare(
+            "SELECT 'credential', credential_value, space_id, server_id, credential_type
+               FROM credentials
+             UNION ALL
+             SELECT 'client_secret', client_secret_encrypted, space_id, server_id, ''
+               FROM outbound_oauth_clients
+              WHERE client_secret_encrypted IS NOT NULL AND client_secret_encrypted != ''
+             UNION ALL
+             SELECT 'input_values', input_values, id, '', ''
+               FROM installed_servers
+              WHERE input_values IS NOT NULL AND input_values != ''
+                AND substr(input_values, 1, 1) NOT IN ('{', '[')
+             UNION ALL
+             SELECT 'env_overrides', env_overrides, id, '', ''
+               FROM installed_servers
+              WHERE env_overrides IS NOT NULL AND env_overrides != ''
+                AND substr(env_overrides, 1, 1) NOT IN ('{', '[')
+             UNION ALL
+             SELECT 'args_append', args_append, id, '', ''
+               FROM installed_servers
+              WHERE args_append IS NOT NULL AND args_append != ''
+                AND substr(args_append, 1, 1) NOT IN ('{', '[')
+             UNION ALL
+             SELECT 'extra_headers', extra_headers, id, '', ''
+               FROM installed_servers
+              WHERE extra_headers IS NOT NULL AND extra_headers != ''
+                AND substr(extra_headers, 1, 1) NOT IN ('{', '[')
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let kind: String = row.get(0)?;
+            let (a, b, c): (String, String, String) = (row.get(2)?, row.get(3)?, row.get(4)?);
+            let context = match kind.as_str() {
+                "credential" => binding::credential(&a, &b, &c),
+                "client_secret" => binding::outbound_client_secret(&a, &b),
+                column => binding::installed_server(column, &a),
+            };
+            Ok(EncryptedSample {
+                value: row.get(1)?,
+                context,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// How many stored secrets are not yet bound to their place: unbound
+    /// (legacy) ciphertexts, plaintext server settings, and values that
+    /// couldn't be converted. Zero means every value is bound.
+    pub fn unbound_value_count(&self) -> Result<usize> {
+        const UNBOUND: &str = "IS NOT NULL AND {col} != '' AND substr({col}, 1, 3) != 'v2:'";
+        let mut total = 0;
+        for (table, columns) in [
+            ("credentials", &["credential_value"][..]),
+            ("outbound_oauth_clients", &["client_secret_encrypted"][..]),
+            (
+                "installed_servers",
+                &[
+                    "input_values",
+                    "env_overrides",
+                    "args_append",
+                    "extra_headers",
+                ][..],
+            ),
+        ] {
+            for col in columns {
+                let condition = UNBOUND.replace("{col}", col);
+                let count: i64 = self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {col} {condition}"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                total += count as usize;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Whether every stored secret was found bound at some start (see
+    /// [`Self::mark_ciphertexts_bound`]). From then on, unbound values are
+    /// refused rather than read as legacy data.
+    pub fn ciphertexts_bound(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM app_settings WHERE key = ?1 AND value = 'true'",
+                [CIPHERTEXTS_BOUND_KEY],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Record that every stored secret is bound.
+    pub fn mark_ciphertexts_bound(&self) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?1, 'true', ?2)",
+            rusqlite::params![CIPHERTEXTS_BOUND_KEY, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Re-encrypt credentials and outbound client secrets written by earlier
+    /// versions (unbound ciphertexts) bound to where they are stored. Values
+    /// that don't decrypt with `encryptor` are left untouched. Returns how
+    /// many values changed.
+    pub fn bind_legacy_ciphertexts(&self, encryptor: &crate::FieldEncryptor) -> Result<usize> {
+        use crate::crypto::binding;
+        let mut changed = 0;
+        let credentials: Vec<(String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT space_id, server_id, credential_type, credential_value FROM credentials",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (space, server, kind, value) in credentials {
+            if crate::FieldEncryptor::is_bound(&value) {
+                continue;
+            }
+            let Ok(plaintext) = encryptor.decrypt(&value) else {
+                continue;
+            };
+            let bound = encryptor
+                .encrypt_bound(&plaintext, &binding::credential(&space, &server, &kind))?;
+            changed += self.conn.execute(
+                "UPDATE credentials SET credential_value = ?4
+                 WHERE space_id = ?1 AND server_id = ?2 AND credential_type = ?3",
+                rusqlite::params![space, server, kind, bound],
+            )?;
+        }
+        let secrets: Vec<(String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT space_id, server_id, client_secret_encrypted FROM outbound_oauth_clients
+                 WHERE client_secret_encrypted IS NOT NULL AND client_secret_encrypted != ''",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (space, server, value) in secrets {
+            if crate::FieldEncryptor::is_bound(&value) {
+                continue;
+            }
+            let Ok(plaintext) = encryptor.decrypt(&value) else {
+                continue;
+            };
+            let bound = encryptor.encrypt_bound(
+                &plaintext,
+                &binding::outbound_client_secret(&space, &server),
+            )?;
+            changed += self.conn.execute(
+                "UPDATE outbound_oauth_clients SET client_secret_encrypted = ?3
+                 WHERE space_id = ?1 AND server_id = ?2",
+                rusqlite::params![space, server, bound],
+            )?;
+        }
+        Ok(changed)
     }
 
     /// Execute a closure within a transaction.

@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mcpmux_core::branding;
+use mcpmux_gateway::oauth::is_valid_registered_redirect_uri;
+use mcpmux_gateway::ConsentLookupError;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::RwLock;
@@ -60,7 +62,10 @@ pub struct PendingInitialDeepLink {
 pub fn route_or_buffer_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) {
     match app.try_state::<PendingInitialDeepLink>() {
         Some(pending) if !pending.webview_ready.load(Ordering::Acquire) => {
-            info!("[DeepLink] Webview not ready — buffering URL: {}", url);
+            info!(
+                "[DeepLink] Webview not ready — buffering URL: {}",
+                mcpmux_core::log_redact::url_for_log(url)
+            );
             if let Ok(mut guard) = pending.url.lock() {
                 *guard = Some(url.to_string());
             }
@@ -77,7 +82,10 @@ pub fn flush_pending_deep_link(app: tauri::AppHandle, pending: State<'_, Pending
     pending.webview_ready.store(true, Ordering::Release);
     let buffered = pending.url.lock().ok().and_then(|mut g| g.take());
     if let Some(url) = buffered {
-        info!("[DeepLink] Flushing buffered cold-start URL: {}", url);
+        info!(
+            "[DeepLink] Flushing buffered cold-start URL: {}",
+            mcpmux_core::log_redact::url_for_log(&url)
+        );
         handle_deep_link(&app, &url);
     }
 }
@@ -120,6 +128,8 @@ pub struct ConsentRequestDetails {
     /// Must be returned in the approval request to prove the caller is the
     /// legitimate desktop app UI—not an external script or bot.
     pub consent_token: String,
+    /// True when this client has never been approved before.
+    pub first_time: bool,
 }
 
 /// Window within which an identical deep-link URL is treated as a duplicate
@@ -167,9 +177,15 @@ fn deep_link_is_duplicate(url: &str) -> bool {
 ///
 /// Routes based on the URL path:
 /// - `mcpmux://authorize` - OAuth authorization request (inbound - client approval)
-/// - `mcpmux://callback/oauth` - OAuth callback (outbound - server connection)
+/// - `mcpmux://install` - install a server from the registry
+///
+/// Outbound OAuth callbacks never come through here: they go to the
+/// loopback callback server.
 pub fn handle_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) {
-    info!("[DeepLink] Received: {}", url);
+    info!(
+        "[DeepLink] Received: {}",
+        mcpmux_core::log_redact::url_for_log(url)
+    );
 
     // Validate URL scheme
     if !branding::is_deep_link(url) {
@@ -184,20 +200,10 @@ pub fn handle_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str)
     // deliver for the same warm-launch URL — otherwise the consent modal and
     // `get_pending_consent` fire twice per approval.
     if deep_link_is_duplicate(url) {
-        info!("[DeepLink] Ignoring duplicate within {DEEP_LINK_DEDUP_WINDOW:?}: {url}");
-        return;
-    }
-
-    // Check for OAuth callback first (mcpmux://callback/oauth?...)
-    if branding::is_oauth_callback(url) {
-        let parsed = match Url::parse(url) {
-            Ok(u) => u,
-            Err(e) => {
-                error!("[DeepLink] Failed to parse OAuth callback URL: {}", e);
-                return;
-            }
-        };
-        handle_oauth_callback_deep_link(app, &parsed);
+        info!(
+            "[DeepLink] Ignoring duplicate within {DEEP_LINK_DEDUP_WINDOW:?}: {}",
+            mcpmux_core::log_redact::url_for_log(url)
+        );
         return;
     }
 
@@ -246,7 +252,7 @@ fn handle_authorize_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url:
 
     info!(
         "[DeepLink] Authorization request received: request_id='{}'",
-        request_id
+        mcpmux_core::log_redact::id_for_log(&request_id)
     );
 
     // Emit minimal payload - frontend will fetch details from backend
@@ -298,63 +304,6 @@ fn handle_install_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
-}
-
-/// Handle OAuth callback deep link (legacy - for outbound OAuth server connections)
-///
-/// NOTE: The primary OAuth callback mechanism is now the loopback HTTP server
-/// (per RFC 8252 Section 7.3) which handles callbacks directly. This deep link
-/// handler is kept for backwards compatibility but is not the main path.
-///
-/// The loopback server provides universal compatibility with enterprise security
-/// systems that may block custom URL schemes.
-///
-/// URL format: mcpmux://callback/oauth?code=XXX&state=YYY
-/// Or on error: mcpmux://callback/oauth?error=XXX&error_description=YYY&state=ZZZ
-fn handle_oauth_callback_deep_link<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &Url) {
-    let params: HashMap<_, _> = url.query_pairs().collect();
-
-    // State is required for routing to the correct OAuth flow
-    let state = match params.get("state") {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            error!("[DeepLink] OAuth callback missing required 'state' parameter");
-            return;
-        }
-    };
-
-    let state_short = if state.len() > 8 { &state[..8] } else { &state };
-    info!("[DeepLink] OAuth callback received: state={}", state_short);
-
-    // Build callback struct
-    let callback = mcpmux_gateway::OAuthCallback {
-        code: params.get("code").map(|s| s.to_string()),
-        state,
-        error: params.get("error").map(|s| s.to_string()),
-        error_description: params.get("error_description").map(|s| s.to_string()),
-    };
-
-    // Get the pool service and route the callback
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        // Get GatewayAppState
-        let gateway_state: tauri::State<'_, Arc<RwLock<GatewayAppState>>> = app_handle.state();
-        let app_state = gateway_state.read().await;
-
-        if let Some(ref pool_service) = app_state.pool_service {
-            // Route callback to OAuth manager
-            match pool_service.oauth_manager().handle_callback(callback) {
-                Ok(_) => {
-                    info!("[DeepLink] OAuth callback successfully routed to handler");
-                }
-                Err(e) => {
-                    error!("[DeepLink] Failed to route OAuth callback: {}", e);
-                }
-            }
-        } else {
-            error!("[DeepLink] Pool service not available to handle OAuth callback");
-        }
-    });
 }
 
 // ============================================================================
@@ -422,7 +371,7 @@ pub async fn get_pending_consent(
 ) -> Result<ConsentRequestDetails, ConsentError> {
     info!(
         "[OAuth] Fetching pending consent: request_id='{}'",
-        request_id
+        mcpmux_core::log_redact::id_for_log(&request_id)
     );
 
     let app_state = gateway_state.read().await;
@@ -433,27 +382,19 @@ pub async fn get_pending_consent(
         .as_ref()
         .ok_or_else(ConsentError::gateway_unavailable)?;
 
-    // Look up the pending authorization
-    let auth = {
-        let state = gw_state.read().await;
-        state.pending_authorizations.get(&request_id).cloned()
-    };
-
-    let auth = auth.ok_or_else(|| ConsentError::not_found(&request_id))?;
-
-    // Check if expired
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    if auth.expires_at < now {
-        warn!("[OAuth] Request '{}' has expired", request_id);
-        // Remove expired entry
+    // Look up the consent request (expired requests are dropped)
+    let lookup = {
         let mut state = gw_state.write().await;
-        state.pending_authorizations.remove(&request_id);
-        return Err(ConsentError::expired(&request_id));
-    }
+        state.lookup_pending_consent(&request_id)
+    };
+    let auth = match lookup {
+        Ok(auth) => auth,
+        Err(ConsentLookupError::Expired) => {
+            warn!("[OAuth] Consent request has expired");
+            return Err(ConsentError::expired(&request_id));
+        }
+        Err(_) => return Err(ConsentError::not_found(&request_id)),
+    };
 
     // Extract consent_token (required for security—ensures only the desktop
     // app that retrieved this token via IPC can approve the request)
@@ -464,6 +405,19 @@ pub async fn get_pending_consent(
             message: "Authorization request is missing consent token — it may have been created before this security update. Please retry.".to_string(),
         }
     })?;
+
+    let first_time = {
+        let state = gw_state.read().await;
+        match state.inbound_client_repository() {
+            Some(repo) => !repo
+                .get_client(&auth.client_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.approved),
+            None => true,
+        }
+    };
 
     // Build response with authoritative data from backend
     // The client_name here comes from our database lookup in handlers.rs
@@ -479,6 +433,7 @@ pub async fn get_pending_consent(
         state: auth.state.clone(),
         expires_at: auth.expires_at,
         consent_token,
+        first_time,
     };
 
     info!(
@@ -530,7 +485,7 @@ pub async fn approve_oauth_consent(
         } else {
             "denied"
         },
-        request.request_id
+        mcpmux_core::log_redact::id_for_log(&request.request_id)
     );
 
     let app_state = gateway_state.read().await;
@@ -540,60 +495,55 @@ pub async fn approve_oauth_consent(
         return Err("Gateway not running".to_string());
     };
 
-    // Look up the pending authorization
-    let pending = {
-        let state = gw_state.read().await;
-        state
-            .pending_authorizations
-            .get(&request.request_id)
-            .cloned()
+    // Take the consent request: checks the consent_token (which proves the
+    // caller obtained it via Tauri IPC, not by scraping the HTTP authorization
+    // page), the expiry, and removes it in one step so it is answered once.
+    let taken = {
+        let mut state = gw_state.write().await;
+        state.take_pending_consent(&request.request_id, &request.consent_token)
+    };
+    let pending = match taken {
+        Ok(pending) => pending,
+        Err(ConsentLookupError::TokenMismatch) => {
+            error!("[OAuth] Consent token mismatch — possible unauthorized approval attempt");
+            return Err("Invalid consent token".to_string());
+        }
+        Err(_) => {
+            error!("[OAuth] Consent approval failed: request not found or expired");
+            return Ok(ConsentApprovalResponse {
+                success: false,
+                redirect_url: String::new(),
+                error: Some("Authorization request not found or expired".to_string()),
+            });
+        }
     };
 
-    let Some(pending) = pending else {
-        error!("[OAuth] Consent approval failed: request_id not found");
+    // Never hand the UI a redirect outside the redirect policy, whatever was
+    // stored for the client.
+    if !is_valid_registered_redirect_uri(&pending.redirect_uri) {
+        error!("[OAuth] Refusing to redirect: redirect_uri is outside the redirect policy");
         return Ok(ConsentApprovalResponse {
             success: false,
             redirect_url: String::new(),
-            error: Some("Authorization request not found or expired".to_string()),
+            error: Some("This app's redirect address is not allowed".to_string()),
         });
-    };
-
-    // Validate consent_token: proves the caller obtained this token via Tauri
-    // IPC (get_pending_consent), not by scraping the HTTP authorization page.
-    match &pending.consent_token {
-        Some(expected_token) => {
-            if request.consent_token != *expected_token {
-                error!(
-                    "[OAuth] Consent token mismatch for request_id: {} — possible unauthorized approval attempt",
-                    request.request_id
-                );
-                return Err("Invalid consent token".to_string());
-            }
-        }
-        None => {
-            error!(
-                "[OAuth] Pending authorization missing consent_token for request_id: {}",
-                request.request_id
-            );
-            return Err("Consent token not available".to_string());
-        }
-    }
-
-    // Remove the pending authorization (it's been processed)
-    {
-        let mut state = gw_state.write().await;
-        state.pending_authorizations.remove(&request.request_id);
     }
 
     if !request.approved {
-        // User denied - redirect with error
-        // Client registration remains (unapproved) so they can try again later
-        let mut redirect_url = pending.redirect_uri.clone();
-        redirect_url.push_str(if redirect_url.contains('?') { "&" } else { "?" });
-        redirect_url.push_str("error=access_denied&error_description=User+denied+the+request");
-        if let Some(ref state_param) = pending.state {
-            redirect_url.push_str(&format!("&state={}", urlencoding::encode(state_param)));
-        }
+        // User denied. The denial goes back to loopback and https callbacks
+        // only: a declined request never launches an OS protocol handler.
+        // Client registration remains (unapproved) so they can try again later.
+        let redirect_url = if is_web_redirect(&pending.redirect_uri) {
+            let mut url = pending.redirect_uri.clone();
+            url.push_str(if url.contains('?') { "&" } else { "?" });
+            url.push_str("error=access_denied&error_description=User+denied+the+request");
+            if let Some(ref state_param) = pending.state {
+                url.push_str(&format!("&state={}", urlencoding::encode(state_param)));
+            }
+            url
+        } else {
+            String::new()
+        };
 
         info!(
             "[OAuth] User denied consent for client: {}",
@@ -606,43 +556,27 @@ pub async fn approve_oauth_consent(
         });
     }
 
-    // User approved - generate authorization code
-    use uuid::Uuid;
-    let code = format!("mc_{}", Uuid::new_v4().to_string().replace("-", ""));
-
-    // Auth codes expire in 10 minutes (standard OAuth)
-    let code_expires_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64 + 600) // 10 minutes
-        .unwrap_or(i64::MAX);
-
-    // Store the authorization with the new code and update client alias if provided
-    {
+    // User approved - record the approval, then issue a one-time
+    // authorization code and update the client alias if provided. The
+    // approval comes first: tokens are only honored for approved clients, so
+    // a code issued without it would give the client tokens that don't work.
+    let code = {
         let mut state = gw_state.write().await;
 
-        // Clone pending fields for new authorization
-        let new_pending = mcpmux_gateway::PendingAuthorization {
-            client_id: pending.client_id.clone(),
-            client_name: pending.client_name.clone(),
-            redirect_uri: pending.redirect_uri.clone(),
-            scope: pending.scope.clone(),
-            state: pending.state.clone(),
-            code_challenge: pending.code_challenge.clone(),
-            code_challenge_method: pending.code_challenge_method.clone(),
-            expires_at: code_expires_at,
-            consent_token: None, // Auth code entries don't need consent tokens
-        };
-
-        state.store_pending_authorization(&code, new_pending);
-
-        // Mark client as approved and store any alias override.
         if let Some(repo) = state.inbound_client_repository() {
             if let Err(e) = repo.approve_client(&pending.client_id).await {
                 error!("[OAuth] Failed to approve client: {}", e);
-            } else {
-                info!("[OAuth] Client approved: {}", pending.client_id);
+                return Ok(ConsentApprovalResponse {
+                    success: false,
+                    redirect_url: String::new(),
+                    error: Some("Could not save the approval".to_string()),
+                });
             }
+            info!("[OAuth] Client approved: {}", pending.client_id);
+        }
+        let code = state.issue_authorization_code(&pending);
 
+        if let Some(repo) = state.inbound_client_repository() {
             if let Some(alias) = request
                 .client_alias
                 .as_deref()
@@ -669,7 +603,8 @@ pub async fn approve_oauth_consent(
             client_name: pending.client_id.clone(), // Use client_name field
             registration_type: Some("unknown".to_string()), // Will be updated when client metadata is fetched
         });
-    }
+        code
+    };
 
     // Build redirect URL with authorization code
     let mut redirect_url = pending.redirect_uri.clone();
@@ -683,7 +618,6 @@ pub async fn approve_oauth_consent(
         "[OAuth] Authorization approved for client: {}, issuing code",
         pending.client_id
     );
-    info!("[OAuth] Redirect URL: {}", redirect_url);
 
     Ok(ConsentApprovalResponse {
         success: true,
@@ -759,14 +693,14 @@ pub async fn get_oauth_clients(
 
 /// Approve a registered OAuth client by ID (for E2E testing only).
 ///
-/// Guarded by the `MCPMUX_E2E_TEST` environment variable. In production
-/// builds this command is a no-op that returns an error.
+/// Only works in builds with the `e2e` feature and with `MCPMUX_E2E_TEST` set;
+/// everywhere else it returns an error without touching any client.
 #[tauri::command]
 pub async fn approve_oauth_client(
     client_id: String,
     gateway_state: State<'_, Arc<RwLock<GatewayAppState>>>,
 ) -> Result<(), String> {
-    if std::env::var("MCPMUX_E2E_TEST").is_err() {
+    if !cfg!(feature = "e2e") || std::env::var("MCPMUX_E2E_TEST").is_err() {
         return Err("approve_oauth_client is only available in E2E test mode".to_string());
     }
 
@@ -1295,10 +1229,17 @@ fn open_url_no_flash(url: &str) -> Result<(), String> {
 /// For regular http/https URLs to remote hosts, opens in the default browser.
 #[tauri::command]
 pub async fn open_url(url: String) -> Result<(), String> {
-    info!("[OAuth] Processing redirect URL: {}", url);
+    info!(
+        "[OAuth] Processing redirect URL: {}",
+        mcpmux_core::log_redact::url_for_log(&url)
+    );
 
     // Parse the URL to determine how to handle it
     let parsed = Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
+    if !is_openable_url(&url) {
+        warn!("[OAuth] Refusing to open a URL outside http(s) and the OAuth redirect policy");
+        return Err("This link can't be opened".to_string());
+    }
 
     // Check if this is a localhost callback (VS Code, etc.)
     let is_localhost = matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1"));
@@ -1307,10 +1248,18 @@ pub async fn open_url(url: String) -> Result<(), String> {
     if is_localhost && is_http {
         // For localhost callbacks, make a direct HTTP request
         // This avoids opening a browser window for a cleaner UX
-        info!("[OAuth] Delivering callback directly to localhost: {}", url);
+        info!(
+            "[OAuth] Delivering callback directly to localhost: {}",
+            mcpmux_core::log_redact::url_for_log(&url)
+        );
 
+        // The URL carries the authorization code: send it only to the app's
+        // loopback listener, not on to wherever that answers with a redirect,
+        // and not through a proxy.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -1333,7 +1282,9 @@ pub async fn open_url(url: String) -> Result<(), String> {
             }
             Err(e) => {
                 // Connection refused likely means the client's server closed
-                // This can happen if the user took too long to approve
+                // This can happen if the user took too long to approve.
+                // The error's URL carries the authorization code: drop it.
+                let e = e.without_url();
                 error!("[OAuth] Failed to deliver callback: {}", e);
                 Err(format!("Failed to deliver OAuth callback. The application may have timed out waiting. Please try again. Error: {}", e))
             }
@@ -1341,9 +1292,16 @@ pub async fn open_url(url: String) -> Result<(), String> {
     } else {
         // For custom protocols (cursor://, vscode://) or remote URLs, use system handler
         // Use ShellExecuteW on Windows to avoid terminal flash
-        info!("[OAuth] Opening URL with system handler: {}", url);
+        info!(
+            "[OAuth] Opening URL with system handler: {}",
+            mcpmux_core::log_redact::url_for_log(&url)
+        );
         open_url_no_flash(&url).map_err(|e| {
-            error!("[OAuth] Failed to open URL '{}': {}", url, e);
+            error!(
+                "[OAuth] Failed to open URL '{}': {}",
+                mcpmux_core::log_redact::url_for_log(&url),
+                e
+            );
             e
         })?;
 
@@ -1457,9 +1415,52 @@ pub async fn revoke_oauth_client_feature_set(
     Ok(())
 }
 
+/// A redirect delivered over HTTP(S): a loopback callback or an https page.
+fn is_web_redirect(uri: &str) -> bool {
+    Url::parse(uri).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// What `open_url` may hand to the OS: web links, and OAuth redirects allowed
+/// by the redirect policy (e.g. `cursor://`). Anything else (`file:`,
+/// `search-ms:`, ...) is refused.
+fn is_openable_url(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+        || is_valid_registered_redirect_uri(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_url_only_accepts_web_links_and_allowed_redirects() {
+        for url in [
+            "https://github.com/mcpmux/mcp-mux",
+            "http://127.0.0.1:8765/callback?code=mc_1",
+            "cursor://anysphere.cursor-mcp/oauth/callback?code=mc_1",
+        ] {
+            assert!(is_openable_url(url), "{url}");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "search-ms:query=x",
+            "ms-officecmd:{}",
+            "smb://host/share",
+            "not a url",
+        ] {
+            assert!(!is_openable_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn denials_only_go_back_over_http() {
+        assert!(is_web_redirect("http://127.0.0.1:8765/callback"));
+        assert!(is_web_redirect("https://chatgpt.com/connector/oauth/abc"));
+        assert!(!is_web_redirect(
+            "cursor://anysphere.cursor-mcp/oauth/callback"
+        ));
+    }
 
     const W: Duration = Duration::from_secs(3);
     const URL: &str = "mcpmux://authorize?request_id=abc-123";

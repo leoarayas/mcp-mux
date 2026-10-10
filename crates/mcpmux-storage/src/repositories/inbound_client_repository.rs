@@ -11,7 +11,7 @@
 //! 3. Pre-registration - server pre-configures client_id
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -181,6 +181,21 @@ pub struct ApiKeyAuth {
     pub client_id: String,
 }
 
+/// Outcome of presenting a refresh token of a family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshRotation {
+    /// Accepted: issue a refresh token with this id. It is the new current
+    /// id, or, for a retry within the grace window, the family's current id
+    /// (so concurrent refreshes all end up holding the current token).
+    Rotated { token_id: String },
+    /// An older token of the family was presented; the family is now revoked.
+    Reused,
+    /// The family was revoked earlier.
+    Revoked,
+    /// No such family for this client.
+    Unknown,
+}
+
 /// OAuth Repository with database persistence
 pub struct InboundClientRepository {
     db: Arc<Mutex<Database>>,
@@ -342,6 +357,24 @@ impl InboundClientRepository {
         }
     }
 
+    /// Dynamically registered clients with this name, approved ones first,
+    /// then oldest first. Several apps (or a squatter) can register under one
+    /// name, so callers pick among them rather than taking any one row.
+    pub async fn find_dcr_clients_by_name(&self, name: &str) -> Result<Vec<InboundClient>> {
+        let db = self.db.lock().await;
+        let conn = db.connection();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM inbound_clients
+             WHERE client_name = ?1 AND registration_type = 'dcr'
+             ORDER BY approved DESC, created_at ASC",
+            Self::CLIENT_COLUMNS
+        ))?;
+        let clients = stmt
+            .query_map(params![name], Self::map_row_to_client)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(clients)
+    }
+
     /// Strict byte-equal membership check of a redirect URI in the client's
     /// registered list. This is a low-level DB lookup; for OAuth policy
     /// decisions (including RFC 8252 §7.3 loopback-port flexibility) use
@@ -370,6 +403,121 @@ impl InboundClientRepository {
         Ok(result)
     }
 
+    /// Start a refresh-token family for a fresh sign-in. Families are not
+    /// pruned; they go away with their client (cascade). An access token
+    /// issued before a family is revoked stays valid until it expires (1 h).
+    pub async fn create_refresh_family(
+        &self,
+        family_id: &str,
+        client_id: &str,
+        token_id: &str,
+    ) -> Result<()> {
+        let db = self.db.lock().await;
+        db.connection().execute(
+            "INSERT INTO inbound_refresh_families (family_id, client_id, current_jti, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                family_id,
+                client_id,
+                token_id,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Rotate a refresh-token family: accept `presented` if it is the
+    /// family's current token and make `next` current. The previous token is
+    /// also accepted, as often as needed, within `grace` of the last rotation
+    /// (a client retrying after a lost response, or two windows refreshing at
+    /// once); it is answered with the current token id, and nothing changes.
+    /// Any other token of the family revokes it.
+    pub async fn rotate_refresh_family(
+        &self,
+        family_id: &str,
+        client_id: &str,
+        presented: &str,
+        next: &str,
+        grace: chrono::Duration,
+    ) -> Result<RefreshRotation> {
+        let db = self.db.lock().await;
+        let conn = db.connection();
+        let row: Option<(String, Option<String>, Option<String>, bool)> = conn
+            .query_row(
+                "SELECT current_jti, previous_jti, rotated_at, revoked
+                 FROM inbound_refresh_families WHERE family_id = ?1 AND client_id = ?2",
+                params![family_id, client_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)),
+            )
+            .optional()?;
+        let Some((current, previous, rotated_at, revoked)) = row else {
+            return Ok(RefreshRotation::Unknown);
+        };
+        if revoked {
+            return Ok(RefreshRotation::Revoked);
+        }
+        let now = chrono::Utc::now();
+        if presented == current {
+            let changed = conn.execute(
+                "UPDATE inbound_refresh_families
+                 SET previous_jti = current_jti, current_jti = ?2, rotated_at = ?3
+                 WHERE family_id = ?1 AND current_jti = ?4 AND revoked = 0",
+                params![family_id, next, now.to_rfc3339(), current],
+            )?;
+            if changed == 0 {
+                return Ok(RefreshRotation::Unknown);
+            }
+            return Ok(RefreshRotation::Rotated {
+                token_id: next.to_string(),
+            });
+        }
+        let within_grace = previous.as_deref() == Some(presented)
+            && rotated_at
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                .is_some_and(|t| now.signed_duration_since(t) <= grace);
+        if within_grace {
+            // The retry gets the current token; nothing changes, so another
+            // concurrent refresh's token stays valid too.
+            return Ok(RefreshRotation::Rotated { token_id: current });
+        }
+        conn.execute(
+            "UPDATE inbound_refresh_families SET revoked = 1 WHERE family_id = ?1",
+            params![family_id],
+        )?;
+        Ok(RefreshRotation::Reused)
+    }
+
+    /// Record a pre-rotation refresh token as used and start a family for
+    /// the client, in one transaction. Returns false (and starts nothing) if
+    /// the token was already used.
+    pub async fn spend_legacy_refresh_token(
+        &self,
+        token_hash: &str,
+        family_id: &str,
+        client_id: &str,
+        token_id: &str,
+    ) -> Result<bool> {
+        let db = self.db.lock().await;
+        let conn = db.connection();
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO inbound_spent_legacy_refresh (token_hash, spent_at)
+             VALUES (?1, ?2)",
+            params![token_hash, now],
+        )?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO inbound_refresh_families (family_id, client_id, current_jti, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![family_id, client_id, token_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Update a client's last_seen timestamp
     pub async fn update_client_last_seen(&self, client_id: &str) -> Result<()> {
         let db = self.db.lock().await;
@@ -386,7 +534,7 @@ impl InboundClientRepository {
     /// Mark a client as approved by the user
     ///
     /// This is called when user explicitly approves the OAuth consent.
-    /// Only approved clients get silent re-authentication.
+    /// Only approved clients can use their tokens or refresh them.
     pub async fn approve_client(&self, client_id: &str) -> Result<()> {
         let db = self.db.lock().await;
         let conn = db.connection();
@@ -472,7 +620,10 @@ impl InboundClientRepository {
         let db = self.db.lock().await;
         let conn = db.connection();
 
-        // Tokens and codes will be deleted via CASCADE
+        // Rows that reference the client go with it (ON DELETE CASCADE): its
+        // grants, codes and any refresh-token records. The tokens themselves
+        // are JWTs and aren't stored; they stop working because every use
+        // requires the client to still exist.
         let rows = conn.execute(
             "DELETE FROM inbound_clients WHERE client_id = ?1",
             params![client_id],

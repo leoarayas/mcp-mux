@@ -1,226 +1,16 @@
-//! Client authentication for the gateway
-//!
-//! Validates client access keys and manages client sessions.
-//! Also provides JWT token creation/validation for OAuth 2.0 flow.
+//! Client authentication for the gateway: JWT access/refresh token
+//! creation and validation for the OAuth 2.0 flow. API keys are validated
+//! by the inbound client repository (see `mcp::oauth_middleware`).
 
 use axum::{
-    body::Body,
     extract::FromRequestParts,
-    http::{header, request::Parts, Request, StatusCode},
-    middleware::Next,
-    response::{IntoResponse, Response},
+    http::{request::Parts, StatusCode},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
-
-use super::server::GatewayState;
+use tracing::debug;
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// Authenticated client from request
-#[derive(Debug, Clone)]
-pub struct AuthenticatedClient {
-    /// Client ID
-    pub client_id: Uuid,
-    /// Access key used
-    pub access_key: String,
-}
-
-/// Access key authentication extractor
-pub struct AccessKeyAuth(pub AuthenticatedClient);
-
-impl<S> FromRequestParts<S> for AccessKeyAuth
-where
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, &'static str);
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Try to get Authorization header
-        let auth_header = parts
-            .headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok());
-
-        let access_key = match auth_header {
-            Some(header) if header.starts_with("Bearer ") => {
-                header.strip_prefix("Bearer ").unwrap().to_string()
-            }
-            Some(header) if header.starts_with("MCP-Key ") => {
-                header.strip_prefix("MCP-Key ").unwrap().to_string()
-            }
-            _ => {
-                // Try X-MCP-Access-Key header
-                parts
-                    .headers
-                    .get("X-MCP-Access-Key")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-                    .ok_or((StatusCode::UNAUTHORIZED, "Missing access key"))?
-            }
-        };
-
-        debug!("Access key authentication attempt");
-
-        // For now, create a mock client
-        // TODO: Validate against actual access keys in state
-        let client = AuthenticatedClient {
-            client_id: Uuid::nil(), // Will be resolved from state
-            access_key,
-        };
-
-        Ok(AccessKeyAuth(client))
-    }
-}
-
-/// Access key format and validation
-#[derive(Debug, Clone)]
-pub struct AccessKey {
-    /// The raw key string
-    pub key: String,
-    /// Client ID this key belongs to
-    pub client_id: Uuid,
-    /// Optional expiry time
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl AccessKey {
-    /// Generate a new access key for a client
-    pub fn generate(client_id: Uuid) -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let random_bytes: [u8; 24] = rng.gen();
-        let key = format!(
-            "mcp_{}",
-            base64::Engine::encode(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                random_bytes
-            )
-        );
-
-        Self {
-            key,
-            client_id,
-            expires_at: None,
-        }
-    }
-
-    /// Generate an access key with expiry
-    pub fn generate_with_expiry(client_id: Uuid, duration: chrono::Duration) -> Self {
-        let mut key = Self::generate(client_id);
-        key.expires_at = Some(chrono::Utc::now() + duration);
-        key
-    }
-
-    /// Check if the key is expired
-    pub fn is_expired(&self) -> bool {
-        match self.expires_at {
-            Some(expires_at) => chrono::Utc::now() >= expires_at,
-            None => false,
-        }
-    }
-
-    /// Validate key format
-    pub fn is_valid_format(key: &str) -> bool {
-        key.starts_with("mcp_") && key.len() >= 36
-    }
-}
-
-/// Access key validator
-pub struct AccessKeyValidator {
-    state: Arc<RwLock<GatewayState>>,
-}
-
-impl AccessKeyValidator {
-    pub fn new(state: Arc<RwLock<GatewayState>>) -> Self {
-        Self { state }
-    }
-
-    /// Validate an access key and return the client ID
-    pub async fn validate(&self, key: &str) -> Option<Uuid> {
-        if !AccessKey::is_valid_format(key) {
-            warn!("Invalid access key format");
-            return None;
-        }
-
-        let state = self.state.read().await;
-        state.validate_access_key(key)
-    }
-
-    /// Register a new access key
-    pub async fn register(&self, key: AccessKey) {
-        let mut state = self.state.write().await;
-        state.register_access_key(key.key, key.client_id);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_access_key_generation() {
-        let client_id = Uuid::new_v4();
-        let key = AccessKey::generate(client_id);
-
-        assert!(key.key.starts_with("mcp_"));
-        assert!(key.key.len() >= 36);
-        assert_eq!(key.client_id, client_id);
-        assert!(!key.is_expired());
-    }
-
-    #[test]
-    fn test_access_key_format_validation() {
-        assert!(AccessKey::is_valid_format(
-            "mcp_abcdefghijklmnopqrstuvwxyz123456"
-        ));
-        assert!(!AccessKey::is_valid_format("invalid_key"));
-        assert!(!AccessKey::is_valid_format("mcp_short"));
-    }
-
-    #[test]
-    fn test_access_key_uniqueness() {
-        let client_id = Uuid::new_v4();
-        let key1 = AccessKey::generate(client_id);
-        let key2 = AccessKey::generate(client_id);
-
-        // Each generation should produce unique key
-        assert_ne!(key1.key, key2.key);
-    }
-
-    #[test]
-    fn test_access_key_with_expiry() {
-        let client_id = Uuid::new_v4();
-        let key = AccessKey::generate_with_expiry(client_id, chrono::Duration::hours(1));
-
-        assert!(key.expires_at.is_some());
-        assert!(!key.is_expired());
-    }
-
-    #[test]
-    fn test_access_key_expired() {
-        let client_id = Uuid::new_v4();
-        // Create key that expired 1 hour ago
-        let mut key = AccessKey::generate(client_id);
-        key.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
-
-        assert!(key.is_expired());
-    }
-
-    #[test]
-    fn test_access_key_no_expiry_never_expires() {
-        let client_id = Uuid::new_v4();
-        let key = AccessKey::generate(client_id);
-
-        // Key without expiry should never be expired
-        assert!(key.expires_at.is_none());
-        assert!(!key.is_expired());
-    }
-}
 
 // ============================================================================
 // JWT Token Management (for OAuth 2.0)
@@ -233,6 +23,13 @@ pub struct TokenClaims {
     pub scope: Option<String>,
     pub exp: i64, // Expiration timestamp
     pub iat: i64, // Issued at timestamp
+    /// `"access"` or `"refresh"`, as set when the token was issued.
+    pub token_type: Option<String>,
+    /// Refresh tokens: the sign-in's token family (`fid`). Absent on refresh
+    /// tokens issued before rotation existed.
+    pub family_id: Option<String>,
+    /// Refresh tokens: this token's id within its family (`jti`).
+    pub token_id: Option<String>,
 }
 
 /// Extractor for authenticated client claims (ISP pattern)
@@ -292,6 +89,18 @@ pub fn validate_token(token: &str, secret: &[u8]) -> Option<TokenClaims> {
         .map(|s| s.to_string());
     let exp = claims.get("exp")?.as_i64()?;
     let iat = claims.get("iat")?.as_i64()?;
+    let token_type = claims
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let string_claim = |name: &str| {
+        claims
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let family_id = string_claim("fid");
+    let token_id = string_claim("jti");
 
     // Check expiration
     let now = chrono::Utc::now().timestamp();
@@ -305,7 +114,21 @@ pub fn validate_token(token: &str, secret: &[u8]) -> Option<TokenClaims> {
         scope,
         exp,
         iat,
+        token_type,
+        family_id,
+        token_id,
     })
+}
+
+/// Validate a token that must be an access token. Refresh tokens are only
+/// accepted at the token endpoint, never as a Bearer credential.
+pub fn validate_access_token(token: &str, secret: &[u8]) -> Option<TokenClaims> {
+    validate_token(token, secret).filter(|claims| claims.token_type.as_deref() == Some("access"))
+}
+
+/// Validate a token that must be a refresh token (for the refresh grant).
+pub fn validate_refresh_token(token: &str, secret: &[u8]) -> Option<TokenClaims> {
+    validate_token(token, secret).filter(|claims| claims.token_type.as_deref() == Some("refresh"))
 }
 
 /// Create a signed access token
@@ -329,8 +152,15 @@ pub fn create_access_token(
     sign_token(&claims.to_string(), secret)
 }
 
-/// Create a signed refresh token
-pub fn create_refresh_token(client_id: &str, scope: Option<&str>, secret: &[u8]) -> String {
+/// Create a signed refresh token belonging to `family_id` (one per sign-in)
+/// with id `token_id`; every refresh issues the family a new id.
+pub fn create_refresh_token(
+    client_id: &str,
+    scope: Option<&str>,
+    family_id: &str,
+    token_id: &str,
+    secret: &[u8],
+) -> String {
     let now = chrono::Utc::now().timestamp();
     // Refresh tokens expire in 30 days
     let exp = now + (30 * 24 * 60 * 60);
@@ -340,7 +170,9 @@ pub fn create_refresh_token(client_id: &str, scope: Option<&str>, secret: &[u8])
         "scope": scope,
         "exp": exp,
         "iat": now,
-        "token_type": "refresh"
+        "token_type": "refresh",
+        "fid": family_id,
+        "jti": token_id
     });
 
     sign_token(&claims.to_string(), secret)
@@ -371,115 +203,6 @@ fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
     URL_SAFE_NO_PAD.decode(s).ok()
 }
 
-/// Authentication middleware for MCP endpoints.
-///
-/// OAuth authentication middleware
-///
-/// Responsibility: Validate JWT tokens and inject claims into request context
-/// Follows SRP: Only handles authentication, not authorization
-pub async fn oauth_auth_middleware(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<GatewayState>>>,
-    mut request: Request<Body>,
-    next: Next,
-) -> Response {
-    // Skip auth for OPTIONS (CORS preflight)
-    if request.method() == axum::http::Method::OPTIONS {
-        return next.run(request).await;
-    }
-
-    let gateway_state = state.read().await;
-
-    // Get base URL and JWT secret
-    let base_url = gateway_state.base_url.clone();
-    let Some(secret) = gateway_state.get_jwt_secret() else {
-        warn!("[Auth] No JWT secret configured - rejecting all requests");
-        return unauthorized_response_with_url(
-            &base_url,
-            "server_error",
-            "Server not configured for authentication",
-        );
-    };
-
-    // Extract Authorization header
-    let auth_header = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    match auth_header {
-        Some(auth) if auth.starts_with("Bearer ") => {
-            let token = &auth[7..];
-
-            // Validate token
-            match validate_token(token, secret) {
-                Some(claims) => {
-                    debug!("[Auth] Valid token for client: {}", claims.client_id);
-
-                    // Inject claims into request extensions (DIP: provide abstraction for handlers)
-                    request.extensions_mut().insert(claims);
-
-                    // Token valid - proceed with request
-                    drop(gateway_state);
-                    next.run(request).await
-                }
-                None => {
-                    warn!("[Auth] Invalid or expired token");
-                    unauthorized_response_with_url(
-                        &base_url,
-                        "invalid_token",
-                        "Token is invalid or expired",
-                    )
-                }
-            }
-        }
-        Some(_) => {
-            warn!("[Auth] Invalid Authorization header format");
-            unauthorized_response_with_url(
-                &base_url,
-                "invalid_request",
-                "Invalid Authorization header format",
-            )
-        }
-        None => {
-            info!("[Auth] No Authorization header - returning 401 with OAuth discovery info");
-            unauthorized_response_with_url(&base_url, "invalid_token", "Missing access token")
-        }
-    }
-}
-
-/// Generate 401 Unauthorized response with OAuth metadata.
-///
-/// Per RFC 9728, the WWW-Authenticate header should include `resource_metadata`
-/// parameter pointing to the OAuth Protected Resource Metadata endpoint.
-fn unauthorized_response_with_url(base_url: &str, error: &str, description: &str) -> Response {
-    // RFC 9728: Protected Resource Metadata URL
-    let resource_metadata_url = format!("{}/.well-known/oauth-protected-resource/mcp", base_url);
-
-    // WWW-Authenticate header per RFC 9728
-    let www_authenticate = format!(
-        r#"Bearer realm="McpMux Gateway", error="{}", error_description="{}", resource_metadata="{}""#,
-        error, description, resource_metadata_url
-    );
-
-    let body = serde_json::json!({
-        "error": error,
-        "error_description": description,
-        "resource_metadata": resource_metadata_url,
-    });
-
-    info!(
-        "[Auth] Returning 401 with resource_metadata={}",
-        resource_metadata_url
-    );
-
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, www_authenticate)],
-        axum::Json(body),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod jwt_tests {
     use super::*;
@@ -506,6 +229,18 @@ mod jwt_tests {
         let claims = validate_token(&token, secret2);
 
         assert!(claims.is_none());
+    }
+
+    #[test]
+    fn access_and_refresh_tokens_are_not_interchangeable() {
+        let secret = b"test_secret_key_32_bytes_long!!";
+        let access = create_access_token("test_client", None, 3600, secret);
+        let refresh = create_refresh_token("test_client", None, "fam", "tok", secret);
+
+        assert!(validate_access_token(&access, secret).is_some());
+        assert!(validate_access_token(&refresh, secret).is_none());
+        assert!(validate_refresh_token(&refresh, secret).is_some());
+        assert!(validate_refresh_token(&access, secret).is_none());
     }
 
     #[test]

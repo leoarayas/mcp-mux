@@ -15,7 +15,7 @@ use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::TransportType;
@@ -63,6 +63,33 @@ impl HttpTransport {
             connect_timeout,
             event_tx,
         }
+    }
+
+    /// `text` with this server's URL (which may carry a key in its query)
+    /// replaced by its log-safe form. Errors from the HTTP stack often quote
+    /// the full request URL.
+    fn without_url(&self, text: String) -> String {
+        if self.url.is_empty() {
+            return text;
+        }
+        text.replace(
+            self.url.as_str(),
+            &mcpmux_core::log_redact::url_for_log(&self.url),
+        )
+    }
+
+    /// Header values long enough to be secrets (API keys, tokens), longest
+    /// first, for scrubbing the server's own log messages.
+    fn header_secrets(&self) -> Arc<Vec<String>> {
+        let mut values: Vec<String> = self
+            .headers
+            .values()
+            .filter(|v| v.len() >= 8)
+            .cloned()
+            .collect();
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        values.dedup();
+        Arc::new(values)
     }
 
     /// Log a message
@@ -127,7 +154,7 @@ impl HttpTransport {
             LogSource::HttpRequest,
             format!(
                 "Connecting to {} with OAuth (auto-refresh enabled, {} custom header(s))",
-                self.url,
+                mcpmux_core::log_redact::url_for_log(&self.url),
                 header_map.len()
             ),
         )
@@ -146,7 +173,7 @@ impl HttpTransport {
         let mut auth_manager = match AuthorizationManager::new(&self.url).await {
             Ok(m) => m,
             Err(e) => {
-                let err = format!("Failed to create auth manager: {}", e);
+                let err = self.without_url(format!("Failed to create auth manager: {}", e));
                 error!(server_id = %self.server_id, "{}", err);
                 self.log(LogLevel::Error, LogSource::HttpRequest, err.clone())
                     .await;
@@ -157,57 +184,76 @@ impl HttpTransport {
         // Set our database-backed credential store
         auth_manager.set_credential_store(credential_store);
 
-        // Load stored metadata from initial OAuth flow
-        // This bypasses RMCP's metadata discovery which can fail on non-spec-compliant servers
-        let has_stored_metadata = if let Ok(Some(registration)) = self
+        let registration = self
             .backend_oauth_repo
             .get(&self.space_id, &self.server_id)
             .await
-        {
-            if let Some(stored_metadata) = registration.metadata {
-                debug!(
+            .unwrap_or_else(|e| {
+                warn!(
                     server_id = %self.server_id,
-                    space_id = %self.space_id,
-                    "Using stored OAuth metadata (bypassing RMCP discovery)"
+                    "Failed to load OAuth client registration: {}", e
                 );
-                let rmcp_metadata =
-                    crate::pool::oauth_utils::convert_from_stored_metadata(&stored_metadata);
-                auth_manager.set_metadata(rmcp_metadata);
-                true
-            } else {
-                // No metadata stored - will need re-auth if refresh is needed
-                debug!(
-                    server_id = %self.server_id,
-                    space_id = %self.space_id,
-                    "No stored metadata - token refresh may fail on non-spec servers"
-                );
-                false
-            }
-        } else {
-            false
-        };
+                None
+            });
 
-        // Initialize from stored credentials
-        let init_result = auth_manager.initialize_from_store().await;
+        // Pin checked metadata before rmcp can refresh with the stored
+        // credentials: the metadata saved at sign-in, or freshly discovered
+        // metadata that passes the same endpoint check. rmcp never
+        // re-discovers it unchecked.
+        use crate::pool::oauth_utils::{pin_checked_metadata, MetadataPin};
+        match pin_checked_metadata(&mut auth_manager, registration.as_ref(), &self.url).await {
+            MetadataPin::Stored | MetadataPin::Discovered => {}
+            MetadataPin::Refused => {
+                self.log(
+                    LogLevel::Warn,
+                    LogSource::OAuth,
+                    "OAuth metadata names an endpoint McpMux won't use; sign-in required"
+                        .to_string(),
+                )
+                .await;
+                return TransportConnectResult::OAuthRequired {
+                    server_url: self.url.clone(),
+                };
+            }
+            MetadataPin::Unavailable => {
+                // Some servers don't publish metadata. Use the stored access
+                // token as is (no refresh, so no credentials go to a token
+                // endpoint).
+                self.log(
+                    LogLevel::Warn,
+                    LogSource::OAuth,
+                    "OAuth metadata unavailable, trying the stored access token".to_string(),
+                )
+                .await;
+                return self.connect_with_manual_token(header_map).await;
+            }
+        }
+        // Initialize from stored credentials, including the client secret rmcp doesn't
+        // restore. A stored client that can't be configured comes back as Ok(false).
+        let init_result = crate::pool::oauth_utils::initialize_from_store(
+            &mut auth_manager,
+            registration.as_ref(),
+        )
+        .await;
 
         match init_result {
             Ok(true) => {
                 debug!(
                     server_id = %self.server_id,
                     space_id = %self.space_id,
-                    "Initialized from stored credentials (has_metadata={})", has_stored_metadata
+                    "Initialized from stored credentials"
                 );
             }
             Ok(false) => {
                 debug!(
                     server_id = %self.server_id,
-                    "No stored credentials found"
+                    "No usable stored credentials found"
                 );
-                // No stored credentials - OAuth required
+                // No stored credentials, or a stored client that can't be configured
                 self.log(
                     LogLevel::Info,
                     LogSource::OAuth,
-                    "No stored credentials, OAuth required".to_string(),
+                    "No usable stored credentials, OAuth required".to_string(),
                 )
                 .await;
                 return TransportConnectResult::OAuthRequired {
@@ -215,34 +261,12 @@ impl HttpTransport {
                 };
             }
             Err(e) => {
-                // RMCP metadata discovery failed AND we don't have stored metadata
-                // Fall back to manual token injection as last resort
-                debug!(
-                    server_id = %self.server_id,
-                    "RMCP initialize_from_store failed: {} (stored_metadata={})", e, has_stored_metadata
-                );
-
-                if has_stored_metadata {
-                    // We had metadata but RMCP still failed - this shouldn't happen
-                    let err = format!("OAuth initialization failed despite stored metadata: {}", e);
-                    error!(server_id = %self.server_id, "{}", err);
-                    self.log(LogLevel::Error, LogSource::OAuth, err.clone())
-                        .await;
-                    return TransportConnectResult::Failed(err);
-                }
-
-                // No stored metadata - try manual token injection
-                self.log(
-                    LogLevel::Warn,
-                    LogSource::OAuth,
-                    format!(
-                        "OAuth metadata discovery failed: {}, trying manual token injection",
-                        e
-                    ),
-                )
-                .await;
-
-                return self.connect_with_manual_token(header_map).await;
+                // Metadata is pinned, so rmcp didn't need to discover it.
+                let err = self.without_url(format!("OAuth initialization failed: {}", e));
+                error!(server_id = %self.server_id, "{}", err);
+                self.log(LogLevel::Error, LogSource::OAuth, err.clone())
+                    .await;
+                return TransportConnectResult::Failed(err);
             }
         }
 
@@ -261,6 +285,7 @@ impl HttpTransport {
             self.space_id,
             self.event_tx.clone(),
             self.log_manager.clone(),
+            self.header_secrets(),
         );
 
         let connect_future = client_handler.serve(transport);
@@ -295,7 +320,7 @@ impl HttpTransport {
                         server_url: self.url.clone(),
                     }
                 } else {
-                    let err = format!("HTTP auth connection failed: {}", e);
+                    let err = self.without_url(format!("HTTP auth connection failed: {}", e));
                     error!(server_id = %self.server_id, "{}", err);
                     self.log(LogLevel::Error, LogSource::HttpResponse, err.clone())
                         .await;
@@ -354,7 +379,10 @@ impl HttpTransport {
         self.log(
             LogLevel::Info,
             LogSource::HttpRequest,
-            format!("Connecting to {} with manual token injection", self.url),
+            format!(
+                "Connecting to {} with manual token injection",
+                mcpmux_core::log_redact::url_for_log(&self.url)
+            ),
         )
         .await;
 
@@ -384,6 +412,7 @@ impl HttpTransport {
             self.space_id,
             self.event_tx.clone(),
             self.log_manager.clone(),
+            self.header_secrets(),
         );
 
         let connect_future = client_handler.serve(transport);
@@ -418,7 +447,8 @@ impl HttpTransport {
                         server_url: self.url.clone(),
                     }
                 } else {
-                    let err = format!("HTTP connection with manual token failed: {}", e);
+                    let err = self
+                        .without_url(format!("HTTP connection with manual token failed: {}", e));
                     error!(server_id = %self.server_id, "{}", err);
                     self.log(LogLevel::Error, LogSource::HttpResponse, err.clone())
                         .await;
@@ -490,7 +520,7 @@ impl HttpTransport {
             LogSource::HttpRequest,
             format!(
                 "Connecting to {} without auth ({} custom header(s))",
-                self.url,
+                mcpmux_core::log_redact::url_for_log(&self.url),
                 header_map.len()
             ),
         )
@@ -508,6 +538,7 @@ impl HttpTransport {
             self.space_id,
             self.event_tx.clone(),
             self.log_manager.clone(),
+            self.header_secrets(),
         );
 
         let connect_future = client_handler.serve(transport);
@@ -542,7 +573,7 @@ impl HttpTransport {
                         server_url: self.url.clone(),
                     }
                 } else {
-                    let err = format!("HTTP connection failed: {}", e);
+                    let err = self.without_url(format!("HTTP connection failed: {}", e));
                     error!(server_id = %self.server_id, "{}", err);
                     self.log(LogLevel::Error, LogSource::HttpResponse, err.clone())
                         .await;
@@ -565,14 +596,17 @@ impl Transport for HttpTransport {
     async fn connect(&self) -> TransportConnectResult {
         info!(
             server_id = %self.server_id,
-            url = %self.url,
+            url = %mcpmux_core::log_redact::url_for_log(&self.url),
             "Connecting to HTTP server"
         );
 
         self.log(
             LogLevel::Info,
             LogSource::Connection,
-            format!("Connecting to HTTP server: {}", self.url),
+            format!(
+                "Connecting to HTTP server: {}",
+                mcpmux_core::log_redact::url_for_log(&self.url)
+            ),
         )
         .await;
 

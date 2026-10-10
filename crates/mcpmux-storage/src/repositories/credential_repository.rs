@@ -13,7 +13,7 @@ use rusqlite::{params, OptionalExtension};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::crypto::FieldEncryptor;
+use crate::crypto::{binding, FieldEncryptor};
 use crate::Database;
 
 /// Raw row data extracted from SQLite before decryption.
@@ -45,17 +45,24 @@ impl SqliteCredentialRepository {
         Self { db, encryptor }
     }
 
-    /// Encrypt a credential value for storage.
-    fn encrypt_value(&self, value: &str) -> Result<String> {
+    /// Encrypt a credential value for storage, bound to its Space, server
+    /// and credential type.
+    fn encrypt_value(&self, credential: &Credential) -> Result<String> {
+        let context = binding::credential(
+            &credential.space_id.to_string(),
+            &credential.server_id,
+            credential.credential_type.as_str(),
+        );
         self.encryptor
-            .encrypt(value)
+            .encrypt_bound(&credential.value, &context)
             .map_err(|e| anyhow::anyhow!("Failed to encrypt credential value: {}", e))
     }
 
-    /// Decrypt a credential value from storage.
-    fn decrypt_value(&self, encrypted: &str) -> Result<String> {
+    /// Decrypt a stored credential value.
+    fn decrypt_value(&self, row: &RawCredentialRow) -> Result<String> {
+        let context = binding::credential(&row.space_id, &row.server_id, &row.credential_type);
         self.encryptor
-            .decrypt(encrypted)
+            .decrypt_bound(&row.credential_value, &context)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt credential value: {}", e))
     }
 
@@ -97,7 +104,7 @@ impl SqliteCredentialRepository {
 
     /// Build a Credential from extracted row data (needs &self for decryption).
     fn build_credential(&self, row: RawCredentialRow) -> Result<Credential> {
-        let value = self.decrypt_value(&row.credential_value)?;
+        let value = self.decrypt_value(&row)?;
         let credential_type = CredentialType::parse(&row.credential_type)
             .ok_or_else(|| anyhow::anyhow!("Unknown credential type: {}", row.credential_type))?;
 
@@ -165,7 +172,7 @@ impl CredentialRepository for SqliteCredentialRepository {
         let db = self.db.lock().await;
         let conn = db.connection();
 
-        let encrypted_value = self.encrypt_value(&credential.value)?;
+        let encrypted_value = self.encrypt_value(credential)?;
 
         conn.execute(
             "INSERT INTO credentials (id, space_id, server_id, credential_type, credential_value, expires_at, token_type, scope, last_used_at, created_at, updated_at)
@@ -191,6 +198,9 @@ impl CredentialRepository for SqliteCredentialRepository {
                 credential.updated_at.to_rfc3339(),
             ],
         )?;
+        // A save often replaces a value (a refreshed token): don't leave the
+        // old one in the WAL.
+        db.checkpoint_wal();
 
         Ok(())
     }
@@ -208,6 +218,7 @@ impl CredentialRepository for SqliteCredentialRepository {
             "DELETE FROM credentials WHERE space_id = ?1 AND server_id = ?2 AND credential_type = ?3",
             params![space_id.to_string(), server_id, credential_type.as_str()],
         )?;
+        db.checkpoint_wal();
 
         Ok(())
     }
@@ -220,6 +231,7 @@ impl CredentialRepository for SqliteCredentialRepository {
             "DELETE FROM credentials WHERE space_id = ?1 AND server_id = ?2",
             params![space_id.to_string(), server_id],
         )?;
+        db.checkpoint_wal();
 
         Ok(())
     }
@@ -233,6 +245,9 @@ impl CredentialRepository for SqliteCredentialRepository {
             "DELETE FROM credentials WHERE space_id = ?1 AND server_id = ?2 AND credential_type IN ('access_token', 'refresh_token')",
             params![space_id.to_string(), server_id],
         )?;
+        if deleted > 0 {
+            db.checkpoint_wal();
+        }
 
         Ok(deleted > 0)
     }
@@ -494,8 +509,9 @@ mod tests {
         // Raw value should NOT contain the plaintext secret
         assert!(!raw_value.contains(secret_token));
 
-        // Raw value should be hex-encoded (encrypted)
-        assert!(hex::decode(&raw_value).is_ok());
+        // Raw value is a bound ciphertext: `v2:` + hex
+        let hex_part = raw_value.strip_prefix("v2:").expect("bound ciphertext");
+        assert!(hex::decode(hex_part).is_ok());
 
         // But expires_at and token_type should be plaintext (queryable)
         let (cred_type, expires_at): (String, Option<String>) = conn

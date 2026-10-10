@@ -140,6 +140,35 @@ pub fn outbound_oauth_client_metadata_url() -> String {
     format!("https://{}/oauth/client-metadata.json", DOMAIN)
 }
 
+/// Get the homepage URL McpMux reports as `client_uri` for outbound OAuth
+///
+/// Sent in Dynamic Client Registration (RFC 7591) so a consent page can link to
+/// McpMux. Must match `client_uri` in the published Client ID Metadata Document.
+///
+/// # Example
+/// ```ignore
+/// let url = branding::outbound_oauth_client_uri();
+/// // Returns: "https://mcpmux.com"
+/// ```
+pub fn outbound_oauth_client_uri() -> String {
+    format!("https://{}", DOMAIN)
+}
+
+/// Get the logo URL McpMux reports as `logo_uri` for outbound OAuth
+///
+/// Sent in Dynamic Client Registration (RFC 7591) so the authorization server's
+/// consent page shows McpMux's logo. Must match `logo_uri` in the published
+/// Client ID Metadata Document.
+///
+/// # Example
+/// ```ignore
+/// let url = branding::outbound_oauth_logo_uri();
+/// // Returns: "https://mcpmux.com/logo.svg"
+/// ```
+pub fn outbound_oauth_logo_uri() -> String {
+    format!("https://{}/logo.svg", DOMAIN)
+}
+
 /// Default preferred port for OAuth callbacks (adjacent to gateway port)
 ///
 /// Uses a high port number to avoid conflicts:
@@ -160,30 +189,6 @@ pub const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 45819;
 /// ```
 pub fn oauth_callback_uri_with_port(port: u16) -> String {
     format!("http://127.0.0.1:{}{}", port, oauth_callback_path())
-}
-
-/// Check if a URL is a loopback OAuth callback for this app
-///
-/// Matches both IPv4 (127.0.0.1) and IPv6 ([::1]) loopback addresses
-/// with the expected callback path.
-///
-/// # Example
-/// ```ignore
-/// assert!(branding::is_oauth_callback("http://127.0.0.1:9876/oauth2redirect?code=123"));
-/// assert!(branding::is_oauth_callback("http://[::1]:9876/oauth2redirect?code=123"));
-/// assert!(!branding::is_oauth_callback("https://example.com"));
-/// ```
-pub fn is_oauth_callback(url: &str) -> bool {
-    let path = oauth_callback_path();
-    // Match IPv4 loopback
-    if url.starts_with("http://127.0.0.1:") && url.contains(path) {
-        return true;
-    }
-    // Match IPv6 loopback
-    if url.starts_with("http://[::1]:") && url.contains(path) {
-        return true;
-    }
-    false
 }
 
 // =============================================================================
@@ -277,31 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_oauth_callback() {
-        // IPv4 loopback should match
-        assert!(is_oauth_callback("http://127.0.0.1:9876/oauth2redirect"));
-        assert!(is_oauth_callback(
-            "http://127.0.0.1:9876/oauth2redirect?code=123&state=abc"
-        ));
-        assert!(is_oauth_callback(
-            "http://127.0.0.1:51234/oauth2redirect?error=access_denied"
-        ));
-
-        // IPv6 loopback should match
-        assert!(is_oauth_callback("http://[::1]:9876/oauth2redirect"));
-        assert!(is_oauth_callback(
-            "http://[::1]:9876/oauth2redirect?code=123"
-        ));
-
-        // Non-matching formats
-        assert!(!is_oauth_callback("https://127.0.0.1:9876/oauth2redirect")); // https not http
-        assert!(!is_oauth_callback("http://localhost:9876/oauth2redirect")); // localhost not IP
-        assert!(!is_oauth_callback("http://127.0.0.1:9876/callback")); // wrong path
-        assert!(!is_oauth_callback("https://example.com/oauth2redirect"));
-        assert!(!is_oauth_callback("mcpmux://callback/oauth")); // old scheme format
-    }
-
-    #[test]
     fn test_outbound_oauth_client_metadata_url() {
         // SEP-991 / CIMD: the client_id must be an https URL with a non-root path
         // and no query or fragment
@@ -315,6 +295,24 @@ mod tests {
             .expect("https scheme on the branding domain");
         assert!(path.len() > 1 && path.starts_with('/'));
         assert!(!url.contains('?') && !url.contains('#'));
+    }
+
+    #[test]
+    fn test_outbound_oauth_client_identity_matches_published_metadata() {
+        // DCR sends these as client_uri / logo_uri, and CIMD servers read them from
+        // the published document (mcpmux.discover.ui/public/oauth/client-metadata.json),
+        // so a consent page shows the same identity either way. The document lives in
+        // another repo, so its values are copied here: change both together.
+        // A rebranded build publishes its own document.
+        if DOMAIN != "mcpmux.com" {
+            return;
+        }
+        assert_eq!(outbound_oauth_client_uri(), "https://mcpmux.com");
+        assert_eq!(outbound_oauth_logo_uri(), "https://mcpmux.com/logo.svg");
+        assert_eq!(
+            outbound_oauth_client_metadata_url(),
+            "https://mcpmux.com/oauth/client-metadata.json"
+        );
     }
 
     #[test]

@@ -18,12 +18,10 @@ pub mod pool;
 pub mod server;
 pub mod services;
 
-pub use auth::AccessKeyAuth;
-pub use oauth::{OAuthConfig, OAuthManager, OAuthToken};
 pub use permissions::{PermissionFilter, PermissionSet};
 pub use server::{
-    AutoConnectResult, DependenciesBuilder, GatewayConfig, GatewayDependencies, GatewayServer,
-    GatewayServerHandle, GatewayState, PendingAuthorization, StartupOrchestrator,
+    AutoConnectResult, ConsentLookupError, DependenciesBuilder, GatewayConfig, GatewayDependencies,
+    GatewayServer, GatewayServerHandle, GatewayState, PendingAuthorization, StartupOrchestrator,
 };
 
 // Pool module - SOLID architecture

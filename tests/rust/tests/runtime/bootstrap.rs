@@ -155,3 +155,89 @@ async fn runtime_drop_releases_lock_for_next_process() {
         .await
         .expect("third build should succeed after first runtime dropped");
 }
+
+/// With every stored secret bound, startup records it and switches the
+/// encryptor to refuse unbound values; a value that isn't bound keeps it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_refuses_unbound_values_once_everything_is_bound() {
+    let fx = Fixture::new();
+    {
+        let runtime = super::runtime_builder()
+            .with_data_dir(fx.data_dir())
+            .build()
+            .await
+            .expect("runtime build");
+        assert!(runtime.encryptor.requires_bound());
+        assert!(runtime.database.lock().await.ciphertexts_bound());
+    }
+
+    // A fresh data dir with a value from an earlier version (unbound, but
+    // readable: it gets bound) and one that can't be read, so can't be bound:
+    // legacy reads stay on. The readable one also shows the key is right
+    // (with a single key, as on Windows, nothing readable means a wrong key).
+    let fx = Fixture::new();
+    let legacy;
+    {
+        let runtime = super::runtime_builder()
+            .with_data_dir(fx.data_dir())
+            .build()
+            .await
+            .expect("runtime build");
+        legacy = runtime.encryptor.encrypt("token").unwrap();
+        runtime
+            .database
+            .lock()
+            .await
+            .connection()
+            .execute(
+                "INSERT INTO credentials (id, space_id, server_id, credential_type, credential_value, created_at, updated_at)
+                 VALUES ('c0', (SELECT id FROM spaces LIMIT 1), 'srv', 'access_token', ?1, 'now', 'now'),
+                        ('c1', (SELECT id FROM spaces LIMIT 1), 'srv', 'api_key', 'garbage', 'now', 'now')",
+                [&legacy],
+            )
+            .unwrap();
+        // Undo the marker the first start recorded on this empty database.
+        runtime
+            .database
+            .lock()
+            .await
+            .connection()
+            .execute(
+                "DELETE FROM app_settings WHERE key = 'storage.ciphertexts_bound'",
+                [],
+            )
+            .unwrap();
+    }
+    let runtime = super::runtime_builder()
+        .with_data_dir(fx.data_dir())
+        .build()
+        .await
+        .expect("runtime build");
+    assert!(!runtime.encryptor.requires_bound());
+    assert!(!runtime.database.lock().await.ciphertexts_bound());
+    let readable: String = runtime
+        .database
+        .lock()
+        .await
+        .connection()
+        .query_row(
+            "SELECT credential_value FROM credentials WHERE id = 'c0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        mcpmux_storage::FieldEncryptor::is_bound(&readable),
+        "the readable value was bound at startup"
+    );
+    // ...and its old form was checkpointed out of the WAL into the file.
+    let db_path = fx.data_dir().join(mcpmux_storage::DATABASE_FILE);
+    for path in [db_path.clone(), db_path.with_extension("db-wal")] {
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        assert!(
+            !bytes.windows(legacy.len()).any(|w| w == legacy.as_bytes()),
+            "old ciphertext left in {}",
+            path.display()
+        );
+    }
+}
