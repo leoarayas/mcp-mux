@@ -190,7 +190,7 @@ export function WorkspaceInstallPanel({
     <div className="space-y-4" data-testid="workspace-install-panel">
       <p className="text-sm text-[rgb(var(--muted))]">
         Add McpMux to this folder&apos;s MCP config for the apps you use. Each gets an{' '}
-        <code className="text-xs">X-Mcpmux-Workspace</code> header set to this path, so it routes
+        <code className="text-xs">X-Mcpmux-Workspace</code> header (or URL query parameter) set to this path, so it routes
         here automatically — even apps that don&apos;t report the folder.
       </p>
 
