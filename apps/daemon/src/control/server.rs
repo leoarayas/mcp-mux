@@ -149,22 +149,34 @@ async fn accept_loop(listener: UnixListener, state: Arc<ControlState>) {
 }
 
 #[cfg(windows)]
-async fn accept_loop(mut server: NamedPipeServer, pipe_name: String, state: Arc<ControlState>) {
+async fn accept_loop(first: NamedPipeServer, pipe_name: String, state: Arc<ControlState>) {
+    // Keep one idle instance in reserve at all times. A Named Pipe client that
+    // arrives while no instance is free gets ERROR_PIPE_BUSY (os error 231), and
+    // creating the replacement only *after* `connect()` returns leaves a window
+    // in which exactly that happens (a CLI call right behind another one, or a
+    // readiness probe that connects and drops). With a reserve, the next client
+    // always finds a free instance, and the replacement is created off the
+    // critical path.
+    let mut server = first;
+    let mut reserve = match ServerOptions::new().create(&pipe_name) {
+        Ok(next) => next,
+        Err(e) => {
+            warn!(error = %e, "[control] failed to create reserve named pipe instance");
+            return;
+        }
+    };
     loop {
         match server.connect().await {
             Ok(()) => {
                 let connected_client = server;
-                // Construct the next server instance before spawning the connection task
-                // so subsequent clients never hit NotFound / PIPE_BUSY.
-                match ServerOptions::new().create(&pipe_name) {
-                    Ok(next_server) => {
-                        server = next_server;
-                    }
+                server = reserve;
+                reserve = match ServerOptions::new().create(&pipe_name) {
+                    Ok(next) => next,
                     Err(e) => {
                         warn!(error = %e, "[control] failed to create next named pipe instance");
                         break;
                     }
-                }
+                };
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(state, connected_client).await {

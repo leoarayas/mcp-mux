@@ -50,6 +50,26 @@ pub struct ControlClient {
     peer_pid: Option<i32>,
 }
 
+/// Open the control pipe, retrying while every server instance is momentarily
+/// busy (`ERROR_PIPE_BUSY`, os error 231). That state is transient by design on
+/// Windows: the daemon creates a fresh instance right after accepting a client.
+/// Any other error (e.g. the pipe does not exist) is returned immediately.
+#[cfg(windows)]
+async fn open_pipe_with_retry(path: &str) -> std::io::Result<NamedPipeClient> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let mut attempts = 0;
+    loop {
+        match ClientOptions::new().open(path) {
+            Ok(client) => return Ok(client),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempts < 40 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl ControlClient {
     /// Connect to the daemon socket on Unix or Named Pipe on Windows.
     #[cfg(unix)]
@@ -86,7 +106,7 @@ impl ControlClient {
         let path_str = path.to_str().ok_or_else(|| {
             anyhow::anyhow!("control pipe path is not valid utf-8: {}", path.display())
         })?;
-        let client = ClientOptions::new().open(path_str).with_context(|| {
+        let client = open_pipe_with_retry(path_str).await.with_context(|| {
             format!(
                 "cannot reach the McpMux daemon on {} — is mcpmuxd running?",
                 path.display()
